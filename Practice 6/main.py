@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 import joblib
+import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -33,14 +34,18 @@ def root():
 @app.post("/predict")
 def predict(payload: PredictionRequest):
     transport_encoded = 1 if payload.transport_type == "bus" else 0
-    features = [[
-        payload.distance_km,
-        payload.departure_hour,
-        payload.day_of_week,
-        payload.target_duration_min,
-        transport_encoded,
-        is_peak_hour(payload.departure_hour),
-    ]]
+    features = pd.DataFrame(
+        [
+            {
+                "distance_km": payload.distance_km,
+                "departure_hour": payload.departure_hour,
+                "day_of_week": payload.day_of_week,
+                "target_duration_min": payload.target_duration_min,
+                "transport_type": transport_encoded,
+                "is_peak_hour": is_peak_hour(payload.departure_hour),
+            }
+        ]
+    )
 
     model = get_model()
     prediction = int(model.predict(features)[0])
