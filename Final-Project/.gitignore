@@ -1,0 +1,46 @@
+# --- data ---
+datasets/
+ml/data/*.parquet
+ml/models/*.txt
+ml/models/*.parquet
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+.python-version
+*.egg-info/
+backend/__pycache__/
+ml/__pycache__/
+
+# --- ts/next build artifacts ---
+*.tsbuildinfo
+next-env.d.ts
+
+# --- node ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+
+# --- ide ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
+
+# --- secrets ---
+.env
+*.env
+backend/.env
+
+# --- temp ---
+*.log
+*.tmp
+_app.js
+_search.json
+_regions.json
+_manifest.tsv
+urls.txt
+urls_https.txt
