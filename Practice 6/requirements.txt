@@ -4,3 +4,5 @@ scikit-learn
 joblib
 pandas
 numpy
+mlflow
+httpx

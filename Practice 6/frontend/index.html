@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Almaty On-Time Prediction</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Almaty On-Time Prediction</h1>
+    <p class="subtitle">Probabilistic trip planner with a feedback loop</p>
+  </header>
+
+  <main>
+    <section class="map-panel">
+      <div class="map-instructions">
+        <span class="mode-btn active" data-mode="from">1. Pick <b>FROM</b></span>
+        <span class="mode-btn" data-mode="to">2. Pick <b>TO</b></span>
+        <button id="resetBtn" class="reset-btn">Reset</button>
+      </div>
+      <div id="map"></div>
+      <div class="distance-readout">
+        <span>Distance:</span>
+        <strong id="distanceLabel">-</strong>
+        <small id="distanceSource"></small>
+      </div>
+    </section>
+
+    <section class="form-panel">
+      <div class="mode-toggle">
+        <button type="button" class="toggle-btn active" data-appmode="predict">Predict</button>
+        <button type="button" class="toggle-btn" data-appmode="reverse">When to leave?</button>
+      </div>
+
+      <form id="predictForm" class="mode-form">
+        <label>
+          <span>Departure date & time</span>
+          <input type="datetime-local" id="departureDatetime" required />
+          <small id="datetimeHint" class="hint"></small>
+        </label>
+
+        <label>
+          <span>Transport</span>
+          <div class="radio-row">
+            <label class="radio"><input type="radio" name="transport" value="car" checked /> Car</label>
+            <label class="radio"><input type="radio" name="transport" value="bus" /> Bus</label>
+            <label class="radio"><input type="radio" name="transport" value="walk" /> Walk</label>
+            <label class="radio"><input type="radio" name="transport" value="bike" /> Bike/Scooter</label>
+          </div>
+        </label>
+
+        <label>
+          <span>Target duration: <strong id="durationValue">30</strong> min</span>
+          <input type="range" id="targetDuration" min="10" max="90" value="30" />
+        </label>
+
+        <button type="submit" id="submitBtn" disabled>Predict</button>
+      </form>
+
+      <form id="reverseForm" class="mode-form hidden">
+        <label>
+          <span>Arrival deadline</span>
+          <input type="datetime-local" id="arrivalDatetime" required />
+          <small class="hint">Latest departure to still arrive by this moment.</small>
+        </label>
+
+        <label>
+          <span>Transport</span>
+          <div class="radio-row">
+            <label class="radio"><input type="radio" name="transportR" value="car" checked /> Car</label>
+            <label class="radio"><input type="radio" name="transportR" value="bus" /> Bus</label>
+            <label class="radio"><input type="radio" name="transportR" value="walk" /> Walk</label>
+            <label class="radio"><input type="radio" name="transportR" value="bike" /> Bike/Scooter</label>
+          </div>
+        </label>
+
+        <label>
+          <span>Confidence threshold: <strong id="thresholdValue">0.9</strong></span>
+          <input type="range" id="thresholdInput" min="0.5" max="0.99" step="0.01" value="0.9" />
+        </label>
+
+        <button type="submit" id="reverseBtn" disabled>Find latest departure</button>
+      </form>
+
+      <div id="result" class="result hidden"></div>
+      <div id="feedbackBox" class="feedback hidden">
+        <span>How did it actually go?</span>
+        <button type="button" class="fb-btn on" data-actual="1">I arrived on time</button>
+        <button type="button" class="fb-btn off" data-actual="0">I was late</button>
+      </div>
+
+      <div class="mlops">
+        <div class="mlops-stats">
+          <span>Feedback: <strong id="fbTotal">0</strong></span>
+          <span>Agreement: <strong id="fbAgreement">-</strong></span>
+          <span>On-time rate: <strong id="fbOnTime">-</strong></span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
