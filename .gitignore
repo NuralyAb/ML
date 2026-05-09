@@ -1,0 +1,9 @@
+# Leftover working copies of the project that pre-date the move into
+# Final-Project/. The canonical sources live under Final-Project/.
+# Patterns are anchored with `/` so they only match at the repo root and
+# don't accidentally hide Final-Project/backend, Final-Project/ml, etc.
+/backend/
+/datasets/
+/frontend/
+/ml/
+.claude/

@@ -1,0 +1,13 @@
+# Patterns excluded from the Docker build context (root of Final-Project/)
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.local
+**/node_modules
+**/.next
+.git
+datasets/
+mlruns/
+ml/data/feature_panel.parquet
+ml/data/district_panel.parquet
+*.log

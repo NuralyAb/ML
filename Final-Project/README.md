@@ -301,11 +301,11 @@ human-readable Russian variant) and triggers a download via blob URL.
 
 ## 8. Running the stack
 
-### 8.1 Data → model
+### 8.1 Local development
 
 ```bash
 # 1. Install Python dependencies
-python -m pip install -r backend/requirements.txt python-calamine
+python -m pip install -r backend/requirements.txt
 
 # 2. ETL: ~30–60 minutes on 12 GB of source data
 python ml/prepare_data.py
@@ -313,26 +313,23 @@ python ml/prepare_data.py
 # 3. Feature engineering: < 1 minute
 python ml/build_features.py
 
-# 4. Training: ~1–5 minutes
+# 4. Training: ~30 seconds
 python ml/train.py
-```
 
-### 8.2 Backend
+# 5. (Optional) compare against 4 alternative configurations
+python ml/mlflow_experiments.py            # writes mlruns/
+mlflow ui --backend-store-uri ./mlruns     # browse at :5000
 
-```bash
+# 6. Backend
 cd backend
 cp .env.example .env   # add your OPENAI_API_KEY for /api/report
 uvicorn main:app --host 0.0.0.0 --port 8000
-# Swagger docs: http://localhost:8000/docs
-```
+# Swagger docs at http://localhost:8000/docs
 
-### 8.3 Frontend
-
-```bash
-cd frontend
+# 7. Frontend
+cd ../frontend
 npm install
-npm run dev
-# http://localhost:3000
+npm run dev            # http://localhost:3000
 ```
 
 `next.config.js` proxies `/api/*` to `http://localhost:8000/api/*`.
@@ -340,6 +337,64 @@ Point the frontend at a different backend host with:
 ```bash
 NEXT_PUBLIC_API_URL=http://my-host:8000 npm run dev
 ```
+
+### 8.2 Docker Compose (one-shot)
+
+```bash
+# Optional: drop OPENAI_API_KEY into .env at the project root
+echo "OPENAI_API_KEY=sk-..." > .env
+
+# Build & start backend + frontend + MLflow UI
+docker compose up --build
+
+# Services:
+#   FastAPI    http://localhost:8000   (Swagger at /docs)
+#   Next.js    http://localhost:3000
+#   MLflow UI  http://localhost:5000   (5 experiment runs from mlruns/)
+```
+
+The Compose file mounts `./ml/models` and `./ml/data` read-only into
+the backend, so retraining outside Docker (`python ml/train.py`) is
+picked up by the running API on the next request without rebuilding
+the image.
+
+### 8.3 MLflow experiments
+
+`ml/mlflow_experiments.py` runs 5 tracked experiments against the same
+hold-out and persists params + metrics + booster artifacts under
+`./mlruns`:
+
+| Run | Variation | What it tells us |
+| --- | --- | --- |
+| `1_lgbm_baseline` | production hyperparameters | reference point |
+| `2_lgbm_deep` | `num_leaves=256`, `lr=0.03`, 1500 rounds | does extra capacity help? |
+| `3_lgbm_shallow` | `num_leaves=32`, `lr=0.10`, 400 rounds | how cheap can we go? |
+| `4_lgbm_no_log_target` | identical to baseline, no `log1p` | does the log transform help? |
+| `5_lgbm_minimal_features` | only `lag_{1,2,3,6,12}` | how much do rolling/calendar/region features add? |
+
+Results from the latest run (see `ml/models/experiments_summary.csv`):
+
+| Experiment | MAE | RMSE | sMAPE | R² | Time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `1_lgbm_baseline` | 18.68 | 278.79 | 64.3 % | 0.938 | 25.5 s |
+| `2_lgbm_deep` | 18.49 | 263.15 | 69.1 % | 0.944 | 52.7 s |
+| `3_lgbm_shallow` | 19.33 | 308.02 | 63.7 % | 0.924 | 8.8 s |
+| **`4_lgbm_no_log_target`** | **17.90** | **231.28** | **60.8 %** | **0.957** | 29.4 s |
+| `5_lgbm_minimal_features` | 21.65 | 305.77 | 119.0 % | 0.925 | 28.2 s |
+
+Take-aways:
+
+- **`4_lgbm_no_log_target` wins on every metric** — the log1p transform
+  was a defensive choice for the long-tailed count distribution, but
+  with this data volume LightGBM handles raw counts better. Candidate
+  for the next production rollout (would require updating
+  `Forecaster._inference` to skip the `expm1` call).
+- `2_lgbm_deep` improves marginally (−0.19 MAE) at 2× training cost.
+- `3_lgbm_shallow` drops to 8.8 s with only +0.65 MAE — useful for
+  rapid experimentation.
+- `5_lgbm_minimal_features` confirms the value of rolling / calendar /
+  region context: sMAPE doubles (64 → 119 %) and MAE rises +3 when
+  those features are removed.
 
 ---
 
@@ -351,14 +406,18 @@ NEXT_PUBLIC_API_URL=http://my-host:8000 npm run dev
 ├── ml/
 │   ├── prepare_data.py        # ETL xlsx → monthly_panel.parquet
 │   ├── build_features.py      # Feature engineering
-│   ├── train.py               # Train LightGBM + baselines
+│   ├── train.py               # Train production LightGBM + 3 baselines
+│   ├── mlflow_experiments.py  # 5 tracked experiments (compares hyperparams, target, features)
 │   ├── notebooks/eda.ipynb    # Quick EDA
 │   ├── data/                  # parquet artefacts (created by scripts)
-│   └── models/                # model + metadata.json
+│   └── models/
+│       ├── metadata.json      # production metrics + feature importance
+│       └── experiments_summary.csv  # last MLflow sweep (committed)
 ├── backend/
 │   ├── main.py                # FastAPI
 │   ├── inference.py           # Multi-step forecaster
 │   ├── report.py              # DOCX report generator (OpenAI-backed)
+│   ├── Dockerfile             # backend image
 │   ├── .env.example           # env-var template
 │   └── requirements.txt
 ├── frontend/
@@ -366,9 +425,13 @@ NEXT_PUBLIC_API_URL=http://my-host:8000 npm run dev
 │   ├── components/            # KazakhstanMap, GeoHeatmap, ForecastPanel, …
 │   ├── public/                # kz_regions.geojson, kz_districts.geojson
 │   ├── lib/api.ts             # API client
+│   ├── Dockerfile             # frontend multi-stage image
 │   └── tailwind.config.ts     # Design tokens
+├── docker-compose.yml         # backend + frontend + MLflow UI
+├── mlruns/                    # MLflow tracking store (gitignored, regenerable)
 ├── README.md                  # this file
-└── REPORT.md                  # written report (8–10 pages)
+├── REPORT.md                  # written report (8–10 pages)
+└── ML_SUMMARY.md              # 16-section end-to-end ML walk-through
 ```
 
 ---

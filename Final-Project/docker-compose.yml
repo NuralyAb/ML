@@ -1,0 +1,69 @@
+# Med Forecast KZ — full stack via Docker Compose.
+#
+#   docker compose up --build
+#
+#   FastAPI         http://localhost:8000        (Swagger at /docs)
+#   Next.js UI      http://localhost:3000
+#   MLflow UI       http://localhost:5000        (browse 5 experiment runs)
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: med-forecast-backend
+    container_name: med-forecast-backend
+    environment:
+      # Set OPENAI_API_KEY in .env for the LLM-generated executive summary
+      # in /api/report. Without it the endpoint falls back to a deterministic
+      # template — the dashboard never blocks on the LLM.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the trained model so retraining outside Docker is picked up
+      # without an image rebuild.
+      - ./ml/models:/app/ml/models:ro
+      - ./ml/data:/app/ml/data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: med-forecast-frontend
+    container_name: med-forecast-frontend
+    environment:
+      # The frontend's next.config.js proxies /api/* to NEXT_PUBLIC_API_URL.
+      # Inside the Compose network the backend is reachable as `backend`.
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  mlflow:
+    # Lightweight MLflow tracking UI over the local file-backed mlruns/.
+    # No model registry or DB — just a viewer for the experiment runs
+    # produced by `python ml/mlflow_experiments.py`.
+    image: ghcr.io/mlflow/mlflow:v2.18.0
+    container_name: med-forecast-mlflow
+    command: >
+      mlflow server
+      --backend-store-uri /mlruns
+      --default-artifact-root /mlruns
+      --host 0.0.0.0
+      --port 5000
+    volumes:
+      - ./mlruns:/mlruns
+    ports:
+      - "5000:5000"
+    restart: unless-stopped

@@ -4,6 +4,9 @@ ml/data/*.parquet
 ml/models/*.txt
 ml/models/*.parquet
 
+# --- mlflow tracking store (regenerate via `python ml/mlflow_experiments.py`) ---
+mlruns/
+
 # --- python ---
 __pycache__/
 *.pyc
