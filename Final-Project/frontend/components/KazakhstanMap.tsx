@@ -32,6 +32,7 @@ export function KazakhstanMap({
   metricLabel = "Рецептов",
   showDistricts = false,
   zoomedRegion = null,
+  view = "new",
 }: {
   rows: { region: string; total: number }[];
   districtRows?: DistrictRow[];
@@ -42,6 +43,8 @@ export function KazakhstanMap({
   showDistricts?: boolean;
   /** When set, fit map to this region's bounds so its districts are readable. */
   zoomedRegion?: string | null;
+  /** "new" — current 20-polygon layout; "old" — pre-2022 17-polygon layout. */
+  view?: "old" | "new" | "auto";
 }) {
   const [geo, setGeo] = useState<FC | null>(null);
   const [districts, setDistricts] = useState<FC | null>(null);
@@ -49,8 +52,14 @@ export function KazakhstanMap({
   const [hover, setHover] = useState<{ name: string; sub?: string; value: number; x: number; y: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  // Pick the right region GeoJSON based on the view. The two files share the
+  // same schema so the rest of the component is identical.
   useEffect(() => {
-    fetch("/kz_regions.geojson").then((r) => r.json()).then(setGeo).catch(() => null);
+    const path = view === "old" ? "/kz_regions_pre2022.geojson" : "/kz_regions.geojson";
+    fetch(path).then((r) => r.json()).then(setGeo).catch(() => null);
+  }, [view]);
+
+  useEffect(() => {
     fetch("/kz_districts.geojson").then((r) => r.json()).then(setDistricts).catch(() => setDistricts(null));
     fetch("/kz_markers.json").then((r) => r.json()).then(setMarkers).catch(() => setMarkers([]));
   }, []);

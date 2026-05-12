@@ -161,6 +161,55 @@ def _date_filter(start: Optional[str], end: Optional[str], months: Optional[int]
     return where, [], cte
 
 
+# 8 June 2022 — the day Abay, Zhetysu and Ulytau were established by
+# presidential decree (Kazakhstan territorial reform).
+REFORM_DATE = "2022-06-08"
+
+# Pre-2022 administrative regions: Abay was carved out of East Kazakhstan,
+# Zhetysu out of Almaty Region, Ulytau out of Karaganda. In our source
+# data MoH already pre-attributed Abay's records to a separate region
+# from day one, but the boundaries the public knew before June 2022 had
+# Abay merged into East Kazakhstan. Zhetysu and Ulytau records were
+# never split out at the source, so they sit inside Almaty / Karaganda
+# either way — the only meaningful "merge" for the OLD view is Abay.
+OLD_REGION_MERGES = {
+    "Область Абай": "Восточно-Казахстанская область",
+}
+
+
+def _region_expr(view: str) -> str:
+    """SQL expression that produces the effective region name for a given view.
+
+    view = "new" — return `region` unchanged.
+    view = "old" — collapse 2022-reform children back into their parents.
+    """
+    if view != "old":
+        return "region"
+    cases = []
+    for child, parent in OLD_REGION_MERGES.items():
+        cases.append(f"WHEN region = '{child}' THEN '{parent}'")
+    return "CASE " + " ".join(cases) + " ELSE region END"
+
+
+def _resolve_view(view: Optional[str], start: Optional[str], end: Optional[str], months: Optional[int]) -> str:
+    """Decide the effective view ("old" | "new").
+
+    Explicit ?view=old|new wins. If view=auto (or unset) we look at the end of
+    the period: a period entirely before 2022-06-08 → "old", everything else
+    → "new".
+    """
+    if view in ("old", "new"):
+        return view
+    end_str = end
+    if not end_str and not start:
+        # Fallback to "last N months". Since "last" rolls relative to MAX
+        # year_month — which is in 2025 for our data — the period is always
+        # recent, so "new" is the right default.
+        return "new"
+    end_str = end_str or "9999-12-31"
+    return "old" if end_str < REFORM_DATE else "new"
+
+
 @app.get("/api/data-range")
 def data_range():
     """Min/max month available in the panel — used by the UI date selector."""
@@ -181,8 +230,11 @@ def region_summary(
     months: int = 12,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    view: Optional[str] = None,
 ):
     where, params, cte = _date_filter(start, end, months)
+    effective_view = _resolve_view(view, start, end, months)
+    region_expr = _region_expr(effective_view)
     extras = []
     if icd:
         extras.append("icdid = ?"); params.append(icd)
@@ -190,9 +242,17 @@ def region_summary(
         extras.append("substr(icdid,1,1) = ?"); params.append(chapter)
     extra_str = (" AND " + " AND ".join(extras)) if extras else ""
     if not (start or end):
-        sql = f"{cte}SELECT region, SUM(recipe_count) AS total FROM panel, last_m WHERE {where}{extra_str} GROUP BY region ORDER BY total DESC"
+        sql = (
+            f"{cte}SELECT {region_expr} AS region, SUM(recipe_count) AS total "
+            f"FROM panel, last_m WHERE {where}{extra_str} "
+            f"GROUP BY {region_expr} ORDER BY total DESC"
+        )
     else:
-        sql = f"SELECT region, SUM(recipe_count) AS total FROM panel WHERE {where}{extra_str} GROUP BY region ORDER BY total DESC"
+        sql = (
+            f"SELECT {region_expr} AS region, SUM(recipe_count) AS total "
+            f"FROM panel WHERE {where}{extra_str} "
+            f"GROUP BY {region_expr} ORDER BY total DESC"
+        )
     rows = query(sql, params)
     return [{"region": r[0], "total": int(r[1])} for r in rows]
 
@@ -205,12 +265,17 @@ def district_summary(
     months: int = 12,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    view: Optional[str] = None,
 ):
     """Per-district totals filterable by region / icd / icd-chapter / period."""
     where, params, cte = _date_filter(start, end, months)
+    effective_view = _resolve_view(view, start, end, months)
+    region_expr = _region_expr(effective_view)
     extras = []
     if region:
-        extras.append("region = ?"); params.append(region)
+        # In OLD view the caller may pass the parent name (e.g. ВКО); we filter
+        # on the *effective* (mapped) region so the child rows are included.
+        extras.append(f"{region_expr} = ?"); params.append(region)
     if icd:
         extras.append("icdid = ?"); params.append(icd)
     if chapter:
@@ -218,15 +283,15 @@ def district_summary(
     extra_str = (" AND " + " AND ".join(extras)) if extras else ""
     if not (start or end):
         sql = (
-            f"{cte}SELECT region, district, SUM(recipe_count) AS total "
+            f"{cte}SELECT {region_expr} AS region, district, SUM(recipe_count) AS total "
             f"FROM panel, last_m WHERE {where}{extra_str} "
-            f"GROUP BY region, district ORDER BY total DESC"
+            f"GROUP BY {region_expr}, district ORDER BY total DESC"
         )
     else:
         sql = (
-            f"SELECT region, district, SUM(recipe_count) AS total "
+            f"SELECT {region_expr} AS region, district, SUM(recipe_count) AS total "
             f"FROM panel WHERE {where}{extra_str} "
-            f"GROUP BY region, district ORDER BY total DESC"
+            f"GROUP BY {region_expr}, district ORDER BY total DESC"
         )
     rows = query(sql, params)
     return [{"region": r[0], "district": r[1], "total": int(r[2])} for r in rows]
@@ -238,17 +303,22 @@ def heatmap(
     months: int = 24,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    view: Optional[str] = None,
 ):
     where, params, cte = _date_filter(start, end, months)
+    effective_view = _resolve_view(view, start, end, months)
+    region_expr = _region_expr(effective_view)
     if not (start or end):
         sql = (
-            f"{cte}SELECT region, substr(icdid,1,1) AS chapter, SUM(recipe_count) AS total "
-            f"FROM panel, last_m WHERE {where} GROUP BY region, chapter ORDER BY region, chapter"
+            f"{cte}SELECT {region_expr} AS region, substr(icdid,1,1) AS chapter, "
+            f"SUM(recipe_count) AS total FROM panel, last_m WHERE {where} "
+            f"GROUP BY {region_expr}, chapter ORDER BY {region_expr}, chapter"
         )
     else:
         sql = (
-            f"SELECT region, substr(icdid,1,1) AS chapter, SUM(recipe_count) AS total "
-            f"FROM panel WHERE {where} GROUP BY region, chapter ORDER BY region, chapter"
+            f"SELECT {region_expr} AS region, substr(icdid,1,1) AS chapter, "
+            f"SUM(recipe_count) AS total FROM panel WHERE {where} "
+            f"GROUP BY {region_expr}, chapter ORDER BY {region_expr}, chapter"
         )
     rows = query(sql, params)
     return [{"region": r[0], "chapter": r[1], "value": int(r[2])} for r in rows]

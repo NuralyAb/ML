@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
 import { Map as MapIcon, Stethoscope, X, ZoomIn, ZoomOut, Layers } from "lucide-react";
-import { api, IcdRow, Period, RegionTotal, DistrictSummaryRow, DataRange } from "@/lib/api";
+import { api, IcdRow, Period, RegionTotal, DistrictSummaryRow, DataRange, viewFromPeriod, RegionView } from "@/lib/api";
 import { Combobox } from "./Combobox";
 import { KazakhstanMap } from "./KazakhstanMap";
 import { PeriodPicker } from "./PeriodPicker";
@@ -56,6 +56,15 @@ export function GeoHeatmap({
     });
   }, [mode, icdQuery]); // eslint-disable-line
 
+  // The reform of 8 June 2022 created Abay/Zhetysu/Ulytau. We pick which
+  // administrative layout the map should use based on the period being asked
+  // for; the same `view` is forwarded to the backend so totals collapse Abay
+  // back into East Kazakhstan when needed.
+  const view: RegionView = useMemo(
+    () => viewFromPeriod(period, dataRange?.max ?? null),
+    [period, dataRange]
+  );
+
   // Re-fetch totals when filter / period changes.
   useEffect(() => {
     setLoading(true);
@@ -63,10 +72,10 @@ export function GeoHeatmap({
     const filterChapter = mode === "chapter" && chapter ? chapter : undefined;
 
     const reqRegion = api
-      .regionSummary({ icd: filterIcd, chapter: filterChapter, period })
+      .regionSummary({ icd: filterIcd, chapter: filterChapter, period, view })
       .catch(() => [] as RegionTotal[]);
     const reqDistricts = api
-      .districtSummary({ icd: filterIcd, chapter: filterChapter, period })
+      .districtSummary({ icd: filterIcd, chapter: filterChapter, period, view })
       .catch(() => [] as DistrictSummaryRow[]);
 
     Promise.all([reqRegion, reqDistricts]).then(([regs, dists]) => {
@@ -74,7 +83,7 @@ export function GeoHeatmap({
       setDistrictRows(dists);
       setLoading(false);
     });
-  }, [mode, chapter, icd, period]);
+  }, [mode, chapter, icd, period, view]);
 
   const metricLabel = useMemo(() => {
     const periodLabel = period.start || period.end
@@ -218,15 +227,22 @@ export function GeoHeatmap({
           metricLabel={metricLabel}
           showDistricts={showDistricts}
           zoomedRegion={zoomed}
+          view={view}
         />
       </div>
 
-      <div className="mt-3 flex items-center gap-2 text-[11px] text-ink-500">
-        <Stethoscope className="h-3.5 w-3.5 text-rose-500" />
+      <div className="mt-3 flex items-start gap-2 text-[11px] text-ink-500">
+        <Stethoscope className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-500" />
         <span>
           Цвет регионов отражает количество рецептов{" "}
           {mode === "icd" && icd ? `по диагнозу ${icd.icdid}` : (mode === "chapter" && chapter ? `класса ${chapter}` : "всего")}{" "}
           {metricLabel.toLowerCase().includes("за") ? "" : "за выбранный период"}.
+          {view === "old" && (
+            <> Период выбран до реформы 8 июня 2022 — карта в <b>старой</b> разбивке (14 областей + 3 города), Абай слит в ВКО.</>
+          )}
+          {view === "new" && (
+            <> Карта в <b>текущей</b> разбивке (17 областей + 3 города), включая Абай, Жетысу и Улытау.</>
+          )}
           {!zoomed && " Тонкая штриховка — границы районов."}
           {zoomed && " Внутри региона показаны районы и их данные."}
           {" "}Клик по региону выбирает его как фильтр.

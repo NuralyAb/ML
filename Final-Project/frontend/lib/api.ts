@@ -22,6 +22,27 @@ export type Period = {
   months?: number; // fallback: last-N-months
 };
 
+/**
+ * Which administrative layout the map should use.
+ *   "new"  — current 17-oblast structure (Abay/Zhetysu/Ulytau are separate)
+ *   "old"  — pre-8-June-2022 14-oblast structure (Abay merged into East Kazakhstan)
+ *   "auto" — backend decides based on the requested period
+ */
+export type RegionView = "old" | "new" | "auto";
+
+/** 2022-06-08 — territorial reform that created Abay, Zhetysu, Ulytau. */
+export const REFORM_DATE = "2022-06-08";
+
+/** Decide which structure to show client-side (so we can pick the right GeoJSON). */
+export function viewFromPeriod(p?: Period, dataMax?: string | null): RegionView {
+  let end: string | null = p?.end ?? null;
+  if (!end && (p?.months !== undefined || (!p?.start && !p?.end))) {
+    end = dataMax ?? null;
+  }
+  if (!end) return "new";
+  return end < REFORM_DATE ? "old" : "new";
+}
+
 export type HistoricalSeries = {
   region: string;
   icd: string;
@@ -92,6 +113,11 @@ function periodQuery(p?: Period): string {
   return parts.length ? "&" + parts.join("&") : "";
 }
 
+function viewQuery(v?: RegionView): string {
+  if (!v) return "";
+  return `&view=${v}`;
+}
+
 export const api = {
   health:           () => get<{ status: string }>("/api/health"),
   dataRange:        () => get<DataRange>("/api/data-range"),
@@ -106,29 +132,30 @@ export const api = {
     get<HistoricalSeries>(
       `/api/historical?region=${encodeURIComponent(region)}&icd=${encodeURIComponent(icd)}`
     ),
-  regionSummary:    (opts?: { icd?: string; chapter?: string; period?: Period } | string, periodOrUndef?: Period) => {
+  regionSummary:    (opts?: { icd?: string; chapter?: string; period?: Period; view?: RegionView } | string, periodOrUndef?: Period) => {
     // Back-compat: accept (icd, period) signature too.
-    let icd: string | undefined; let chapter: string | undefined; let period: Period | undefined;
+    let icd: string | undefined; let chapter: string | undefined;
+    let period: Period | undefined; let view: RegionView | undefined;
     if (typeof opts === "string" || opts === undefined) {
       icd = opts; period = periodOrUndef;
     } else {
-      icd = opts.icd; chapter = opts.chapter; period = opts.period;
+      icd = opts.icd; chapter = opts.chapter; period = opts.period; view = opts.view;
     }
     const parts = ["_=1"];
     if (icd) parts.push(`icd=${encodeURIComponent(icd)}`);
     if (chapter) parts.push(`chapter=${encodeURIComponent(chapter)}`);
-    return get<RegionTotal[]>(`/api/region-summary?${parts.join("&")}${periodQuery(period)}`);
+    return get<RegionTotal[]>(`/api/region-summary?${parts.join("&")}${periodQuery(period)}${viewQuery(view)}`);
   },
-  districtSummary:  (opts?: { region?: string; icd?: string; chapter?: string; period?: Period }) => {
-    const { region, icd, chapter, period } = opts || {};
+  districtSummary:  (opts?: { region?: string; icd?: string; chapter?: string; period?: Period; view?: RegionView }) => {
+    const { region, icd, chapter, period, view } = opts || {};
     const parts = ["_=1"];
     if (region) parts.push(`region=${encodeURIComponent(region)}`);
     if (icd) parts.push(`icd=${encodeURIComponent(icd)}`);
     if (chapter) parts.push(`chapter=${encodeURIComponent(chapter)}`);
-    return get<DistrictSummaryRow[]>(`/api/district-summary?${parts.join("&")}${periodQuery(period)}`);
+    return get<DistrictSummaryRow[]>(`/api/district-summary?${parts.join("&")}${periodQuery(period)}${viewQuery(view)}`);
   },
-  heatmap:          (p?: Period) =>
-    get<HeatmapCell[]>(`/api/heatmap?_=1${periodQuery(p)}`),
+  heatmap:          (p?: Period, view?: RegionView) =>
+    get<HeatmapCell[]>(`/api/heatmap?_=1${periodQuery(p)}${viewQuery(view)}`),
   topDiseases:      (region?: string, p?: Period, limit = 15) =>
     get<IcdRow[]>(
       `/api/top-diseases?limit=${limit}${region ? `&region=${encodeURIComponent(region)}` : ""}${periodQuery(p)}`

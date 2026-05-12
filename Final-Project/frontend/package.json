@@ -11,6 +11,7 @@
   "dependencies": {
     "@turf/helpers": "^7.3.5",
     "@turf/simplify": "^7.3.5",
+    "@turf/union": "^7.3.5",
     "@types/d3-geo": "^3.1.0",
     "d3-geo": "^3.1.1",
     "framer-motion": "^11.11.17",
