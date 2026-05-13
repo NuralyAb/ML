@@ -1,9 +1,10 @@
 """
 MLflow-tracked experiments for the prescription forecast model.
 
-Eight experiments are defined below — the first five vary one design
-dimension of the LightGBM production model, the last three swap
-LightGBM for a different model family entirely:
+Nine experiments are defined below — the first five vary one design
+dimension of the LightGBM production model, the next three swap
+LightGBM for a different model family entirely, and the last one is an
+ablation that adds an unsupervised K-means cluster id as a feature:
 
   1. lgbm_baseline           production-tuned LightGBM (current default)
   2. lgbm_deep               more capacity (num_leaves=256, lr=0.03, 1500 rounds)
@@ -16,6 +17,9 @@ LightGBM for a different model family entirely:
                              (region, icdid, icd_chapter) — no label encoding
   8. random_forest           sklearn RandomForestRegressor — bagging baseline
                              (no boosting, fundamentally different inductive bias)
+  9. lgbm_with_cluster       baseline LightGBM + the K-means cluster id from
+                             ml/cluster_series.py as an extra categorical feature
+                             (tests whether the unsupervised phenotype helps)
 
 For every run we log:
   - all hyperparameters (params)
@@ -49,6 +53,7 @@ from catboost import CatBoostRegressor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "ml", "data")
 FEATURE_PATH = os.path.join(DATA, "feature_panel.parquet")
+CLUSTERS_PATH = os.path.join(DATA, "series_clusters.parquet")
 MLRUNS_DIR = os.path.join(ROOT, "mlruns")
 
 EXPERIMENT = "med_forecast_kz"
@@ -111,6 +116,7 @@ class ExperimentConfig:
     feature_subset: str = "full"   # "full" | "minimal"
     model_type: str = "lightgbm"   # "lightgbm" | "xgboost" | "catboost" | "random_forest"
     experiment_name: Optional[str] = None  # if set, log to this MLflow experiment instead of EXPERIMENT
+    extra_cat_cols: list[str] = field(default_factory=list)  # additional categorical features to encode
 
 
 EXPERIMENTS: list[ExperimentConfig] = [
@@ -205,6 +211,21 @@ EXPERIMENTS: list[ExperimentConfig] = [
         model_type="random_forest",
         experiment_name="random_forest",
     ),
+    ExperimentConfig(
+        name="9_lgbm_with_cluster",
+        description="Baseline LightGBM + K-means series cluster id as an extra categorical feature. "
+                    "Tests whether the unsupervised behavioural phenotype from ml/cluster_series.py "
+                    "carries forecasting signal that the raw lag/rolling features do not already capture.",
+        params=dict(
+            objective="regression", metric="rmse",
+            learning_rate=0.05, num_leaves=128, min_data_in_leaf=40,
+            feature_fraction=0.9, bagging_fraction=0.9, bagging_freq=5,
+            lambda_l2=1.0, verbose=-1,
+        ),
+        num_boost_round=900, log_target=True, feature_subset="full",
+        extra_cat_cols=["cluster_id"],
+        experiment_name="lgbm_with_cluster",
+    ),
 ]
 
 
@@ -219,9 +240,9 @@ def _split(df: pd.DataFrame):
     return df[~test_mask].copy(), df[test_mask].copy()
 
 
-def _encode(train: pd.DataFrame, test: pd.DataFrame):
+def _encode(train: pd.DataFrame, test: pd.DataFrame, cat_cols: list[str]):
     encs = {}
-    for col in CAT_COLS:
+    for col in cat_cols:
         le = LabelEncoder()
         all_vals = pd.concat([train[col], test[col]]).astype(str).fillna("?")
         le.fit(all_vals)
@@ -236,8 +257,8 @@ import tempfile
 TMPDIR = tempfile.gettempdir()
 
 
-def _train_lightgbm(cfg, X_train, y_train, X_test, feat_cols):
-    cat_idx = [feat_cols.index(c + "_enc") for c in CAT_COLS]
+def _train_lightgbm(cfg, X_train, y_train, X_test, feat_cols, cat_cols):
+    cat_idx = [feat_cols.index(c + "_enc") for c in cat_cols]
     target_train = np.log1p(y_train) if cfg.log_target else y_train
     train_set = lgb.Dataset(X_train, label=target_train, categorical_feature=cat_idx)
 
@@ -281,14 +302,14 @@ def _train_xgboost(cfg, X_train, y_train, X_test, feat_cols):
     return pred, duration, fi, artifact_path
 
 
-def _train_catboost(cfg, train_df, test_df, num_cols):
+def _train_catboost(cfg, train_df, test_df, num_cols, cat_cols):
     # CatBoost takes raw categorical columns directly — no label encoding.
-    feat_cols = num_cols + CAT_COLS
-    cat_features_idx = [feat_cols.index(c) for c in CAT_COLS]
+    feat_cols = num_cols + cat_cols
+    cat_features_idx = [feat_cols.index(c) for c in cat_cols]
 
     X_train = train_df[feat_cols].copy()
     X_test = test_df[feat_cols].copy()
-    for c in CAT_COLS:
+    for c in cat_cols:
         X_train[c] = X_train[c].astype(str).fillna("?")
         X_test[c] = X_test[c].astype(str).fillna("?")
 
@@ -337,26 +358,34 @@ def _train_random_forest(cfg, X_train, y_train, X_test, feat_cols):
 
 def run_experiment(cfg: ExperimentConfig, df: pd.DataFrame) -> dict:
     num_cols = FULL_NUM_COLS if cfg.feature_subset == "full" else MINIMAL_NUM_COLS
+    cat_cols = list(CAT_COLS) + list(cfg.extra_cat_cols)
 
+    missing_cat = [c for c in cat_cols if c not in df.columns]
+    if missing_cat:
+        raise ValueError(
+            f"Experiment {cfg.name} requires categorical column(s) {missing_cat} "
+            f"on the feature panel. Run ml/cluster_series.py first."
+        )
     sub = df.dropna(subset=num_cols).reset_index(drop=True)
+
     train_df, test_df = _split(sub)
-    _encode(train_df, test_df)
+    _encode(train_df, test_df, cat_cols)
 
     y_test = test_df["recipe_count"].astype(float)
 
     if cfg.model_type == "catboost":
         pred, duration, fi, artifact_path, feat_cols = _train_catboost(
-            cfg, train_df, test_df, num_cols
+            cfg, train_df, test_df, num_cols, cat_cols
         )
     else:
-        feat_cols = num_cols + [c + "_enc" for c in CAT_COLS]
+        feat_cols = num_cols + [c + "_enc" for c in cat_cols]
         X_train = train_df[feat_cols]
         y_train = train_df["recipe_count"].astype(float)
         X_test = test_df[feat_cols]
 
         if cfg.model_type == "lightgbm":
             pred, duration, fi, artifact_path = _train_lightgbm(
-                cfg, X_train, y_train, X_test, feat_cols
+                cfg, X_train, y_train, X_test, feat_cols, cat_cols
             )
         elif cfg.model_type == "xgboost":
             pred, duration, fi, artifact_path = _train_xgboost(
@@ -433,6 +462,27 @@ def main(only_names: list[str] | None = None):
         if missing:
             raise SystemExit(f"Unknown experiment name(s): {sorted(missing)}\n"
                              f"Available: {[c.name for c in EXPERIMENTS]}")
+
+    # If any selected experiment needs the K-means cluster id, merge it once
+    # onto the panel. Encoded as string so it routes through the LabelEncoder
+    # path identically to region / icdid / icd_chapter.
+    needs_cluster = any("cluster_id" in c.extra_cat_cols for c in configs)
+    if needs_cluster:
+        if not os.path.exists(CLUSTERS_PATH):
+            raise SystemExit(
+                f"Experiment(s) require cluster_id but {CLUSTERS_PATH} is missing. "
+                f"Run: python ml/cluster_series.py"
+            )
+        clusters = pd.read_parquet(CLUSTERS_PATH)[["region", "icdid", "cluster_id"]]
+        clusters["cluster_id"] = "c" + clusters["cluster_id"].astype(int).astype(str)
+        before = len(df)
+        df = df.merge(clusters, on=["region", "icdid"], how="left")
+        unmatched = df["cluster_id"].isna().sum()
+        print(f"merged cluster_id onto feature panel "
+              f"({clusters['cluster_id'].nunique()} clusters, "
+              f"{unmatched:,} rows without a cluster -> filled with '?')")
+        df["cluster_id"] = df["cluster_id"].fillna("?")
+        assert len(df) == before, "cluster merge changed row count"
 
     summaries: list[dict] = []
     for cfg in configs:
