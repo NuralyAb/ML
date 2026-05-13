@@ -1,0 +1,18 @@
+{
+  "n_panel_rows": 113286,
+  "n_flagged": 34843,
+  "share_flagged": 0.30756668961742845,
+  "median_residual_log": 0.0,
+  "mad_residual_log": 0.09738423161539866,
+  "sigma_hat_residual_log": 0.14438186179299006,
+  "tiers": {
+    "critical": 12494,
+    "notice": 9941,
+    "warning": 12408
+  },
+  "directions": {
+    "drop": 15887,
+    "surge": 18956
+  },
+  "computed_at": "2026-05-13T20:49:51.848649+00:00"
+}
