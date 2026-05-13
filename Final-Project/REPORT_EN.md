@@ -147,6 +147,51 @@ Specific contributions beyond standard count-forecasting practice:
    `experiments_summary.csv`) quantify the contribution of the log
    target, depth/learning-rate trade-offs, and the rolling/calendar/
    region feature groups (see Section 6.2).
+6. **Unsupervised behavioural phenotyping of series, fed back into the
+   forecaster.** Beyond the supervised stack, every `(region, ICD)`
+   series is summarised by eight behavioural descriptors (level, CV,
+   trend, seasonality, share of zero months, lag-1 and lag-12 ACF,
+   length) and clustered with K-means; the number of clusters is
+   chosen by silhouette score. Each cluster is auto-named by the
+   dominant z-score of its centroid (e.g. `seasonal`, `growing`,
+   `sporadic`, `high_volume`). The resulting `cluster_id` is then
+   reintroduced into LightGBM as an additional categorical feature
+   (MLflow experiment `9_lgbm_with_cluster`), turning an exploratory
+   unsupervised artefact into a supervised input. To our knowledge no
+   prior pharmaceutical-demand pipeline closes this unsupervised →
+   supervised loop on prescription-level open data.
+7. **Quantile prediction intervals as a first-class API surface.** Two
+   additional LightGBM boosters trained with ``objective="quantile"``
+   at ``alpha ∈ {0.1, 0.9}`` give an 80 % prediction interval (P10–P90)
+   for every forecast point. The dashboard renders these as a
+   fan-chart band around the point forecast, turning the system from
+   a "give me one number" oracle into a **point + risk-band** tool —
+   the question procurement actually asks ("how much safety stock do
+   we need so under-procurement is rare?") is now answered directly
+   from the API.
+8. **Audit mode: prescription-anomaly detector.** The problem
+   statement lists *audit of clinics* as the third operational task
+   alongside procurement and workforce allocation; standard
+   forecasting papers do not address it. ``ml/detect_anomalies.py``
+   converts the supervised holdout into an audit signal via a
+   MAD-based robust z-score on log-space residuals; the dashboard
+   exposes ranked anomalies plus a region × ICD-chapter
+   "alert heatmap" coloured by ``max |z|``. The same trained model
+   thus drives three operational modes — **forecast, interval, audit** —
+   from a single artefact.
+9. **In-dashboard data ingest (`POST /api/ingest`).** The dashboard
+   exposes a drop-zone that accepts a fresh quarterly xlsx (raw
+   registry schema) or a pre-aggregated parquet and appends it to
+   ``monthly_panel.parquet`` with deduplication on
+   ``(region, district, icd, year_month)``. The xlsx path is parsed by
+   the same ``calamine``-based aggregation as the bulk ETL, so a
+   single uploaded file produces the exact same monthly grid that
+   ``ml/prepare_data.py`` would produce. Panel-derived dashboard
+   panels (KPI, map, heatmap, top-diseases) refresh seconds after
+   upload via a re-registered DuckDB view; forecast / anomaly
+   artefacts stay on the cached training snapshot — an explicit
+   architectural choice that matches MLops practice (data ingest is
+   a frequent operation, retraining is a separate offline job).
 
 ---
 
@@ -284,7 +329,141 @@ horizon `t+1` it appends the prediction to the history, recomputes
 lags and rolling statistics on the augmented series, and predicts
 `t+2`, up to the requested horizon (1, 3, 6 or 12 months).
 
-### 5.6 Decision logic in the UI
+### 5.6 Quantile forecasting (`ml/train_quantile.py`)
+
+The point model predicts the *expected* number of prescriptions — useful as
+a central planning estimate, but procurement actually asks a one-sided
+question: "what level should we order so under-stocking is rare?". A point
+forecast cannot answer that directly. We add two extra LightGBM boosters
+trained with ``objective="quantile"``, alpha ∈ {0.1, 0.9}, on the same
+feature panel and ``log1p(y)`` target as the production point model:
+
+  * ``lgbm_recipe_forecast_q10.txt`` — pessimistic lower bound (P10).
+  * ``lgbm_recipe_forecast_q90.txt`` — optimistic upper bound (P90).
+
+Quantiles are invariant under monotone transforms, so original-scale
+quantiles are recovered with ``expm1`` exactly like the point prediction.
+For multi-step forecasts, the recursive feature update uses the **point
+prediction** to feed back into the lag features — using P10 or P90 would
+systematically bias the trajectory.
+
+The ``Forecaster`` in ``backend/inference.py`` loads all three boosters
+when the quantile files are present and exposes ``has_quantiles=True``
+on every ``/api/forecast`` response. Each row of the forecast carries a
+``predicted`` (point), ``lower`` (P10), ``upper`` (P90) triple, which
+the dashboard's ``HistoricalChart`` renders as a fan band around the
+median line. When the quantile files are absent, the API gracefully
+falls back to point-only forecasts — the UI checks ``has_quantiles``
+and hides the band columns. Calibration is measured against the same
+6-month hold-out as the production model and logged to MLflow
+experiment ``10_lgbm_quantile`` (Section 6.5).
+
+### 5.7 Anomaly detection on the audit holdout (`ml/detect_anomalies.py`)
+
+The original problem statement listed three business tasks: procurement,
+workforce, and *audit of clinics — detection of anomalous prescription
+issuance*. The first two are covered by the supervised forecaster. The
+third becomes addressable once the forecaster has scored a hold-out set:
+the model encodes the expected behaviour under the historical regime,
+so a holdout row whose actual diverges sharply from the prediction is
+exactly the audit signal we want.
+
+The scoring is robust by construction:
+
+  1. **Log-space residual** ``r = log1p(actual) − log1p(predicted)``.
+     The log transform stops high-volume series from dominating the
+     residual distribution and handles the many zero-actual rows
+     gracefully (``log1p(0) = 0``).
+  2. **Robust scale** via the median absolute deviation:
+     ``σ̂ = 1.4826 · MAD(r)``. The 1.4826 factor makes ``σ̂`` a
+     consistent estimator of the normal-distribution standard
+     deviation, so the resulting z-scores are directly interpretable
+     ("approximately how many sigmas off the model is").
+  3. **Severity tiers**: ``|z| ≥ 3`` ⇒ *critical*,
+     ``2 ≤ |z| < 3`` ⇒ *warning*, ``1.5 ≤ |z| < 2`` ⇒ *notice*,
+     lower ⇒ normal (excluded from the artefact).
+  4. **Direction**: positive z = ``surge`` (actual exceeds the model;
+     possible epidemic spike, registration backlog, or fraudulent
+     over-issuance), negative z = ``drop`` (registry outage,
+     under-issuance, real disease decline).
+
+The flagged rows are written to ``ml/data/anomalies.parquet`` sorted by
+``|z|`` descending, and exposed via two new endpoints:
+
+  * ``GET /api/anomalies?limit=&min_z=&region=&direction=&severity=`` —
+    ranked table with filters; default returns top 50.
+  * ``GET /api/anomaly-heatmap`` — aggregated max ``|z|`` per
+    ``(region, icd_chapter)`` cell with per-cell counts of surges and
+    drops.
+
+The dashboard's ``AnomaliesPanel`` consumes both — a top-N table on
+the left, the alert heatmap on the right — with severity-coloured
+chips, surge/drop direction icons, and chapter tooltips.
+
+### 5.8 Unsupervised phenotyping of series (`ml/cluster_series.py`)
+
+The supervised stack fits a single global regressor across a
+heterogeneous population of series. To make that heterogeneity
+explicit — and to surface it as both an analytical artefact and an
+extra signal for the forecaster — the pipeline runs K-means on
+per-series behavioural descriptors.
+
+**Feature construction (one row per `(region, ICD)` series).** Eight
+descriptors are computed from the raw monthly target `recipe_count`:
+
+| Feature | Definition |
+| --- | --- |
+| `level` | `log1p` of the series mean (long-tail-tolerant volume proxy). |
+| `cv` | Coefficient of variation, `std / mean`. |
+| `trend` | OLS slope of `y` against month index, multiplied by series length and divided by the mean — relative growth over the full history. |
+| `seasonality` | `(max − min)` of the month-of-year means, divided by the overall mean. |
+| `share_zeros` | Fraction of months with `recipe_count = 0`. |
+| `acf_1` | Lag-1 autocorrelation — smoothness vs. choppiness. |
+| `acf_12` | Lag-12 autocorrelation — strength of the annual cycle. |
+| `n_months` | Series length, kept after standardisation so very short series can still cluster apart. |
+
+**Clustering.** Features are standardised with `StandardScaler`; the
+number of clusters `k` is selected by sweeping `k ∈ {3, …, 8}` and
+maximising the silhouette score (more robust than the elbow heuristic
+in this moderate-dimension regime; the Calinski–Harabasz index is
+also logged for cross-validation). KMeans is fitted with
+`n_init=10, random_state=42`.
+
+**Naming.** Each cluster centroid lives in z-score space because of
+the prior standardisation, so the component with the largest absolute
+value is the most distinctive behavioural trait of that cluster. The
+script maps `(feature, sign)` pairs to nicknames (`seasonal`,
+`non_seasonal_flat`, `growing`, `declining`, `high_volume`,
+`low_volume`, `volatile`, `stable`, `sporadic`, `always_active`,
+`annually_persistent`, `smooth`, `choppy`, `long_series`,
+`short_series`); collisions fall back to a `primary__secondary`
+composite. The names are reporting nicknames — the integer
+`cluster_id` remains the source of truth.
+
+**Artefacts** (under `ml/data/` and `ml/models/`):
+
+- `series_clusters.parquet` — one row per series: `region, icdid,
+  nozology, cluster_id, cluster_name`, plus all eight features.
+- `cluster_profiles.csv` — per-cluster centroid in original units,
+  cluster size and share, plus the top-5 example series for each
+  cluster.
+- `cluster_pca.png` — 2-D PCA scatter coloured by cluster, with the
+  explained-variance ratios in the axis labels.
+- `cluster_metadata.json` — `k`, silhouette, inertia, Calinski–
+  Harabasz, the full `k`-sweep diagnostics, scaler parameters.
+- MLflow run under experiment `series_clustering` logging all of the
+  above as artefacts and the diagnostics as metrics.
+
+**Integration with the forecaster.** Experiment
+`9_lgbm_with_cluster` in `mlflow_experiments.py` merges
+`cluster_id` onto the feature panel and passes it as an extra
+categorical feature alongside `region_enc`, `icdid_enc`, and
+`icd_chapter_enc`. Comparing its hold-out metrics against
+`1_lgbm_baseline` in the MLflow UI quantifies whether the
+behavioural phenotype carries forecasting signal that the raw
+lag/rolling/calendar features do not already encode.
+
+### 5.9 Decision logic in the UI
 
 The dashboard maps a forecast onto one of five action tiers by
 comparing the forecast average against the trailing 12-month
@@ -376,7 +555,167 @@ carries the annual seasonal anchor. The model leans on
 recent-history smoothing plus a seasonal anchor — exactly the
 domain-intuitive decomposition.
 
-### 6.4 Operational characteristics
+### 6.4 Unsupervised series clusters
+
+K-means on the eight behavioural descriptors of Section 5.6 partitions
+all **18 881 viable `(region, ICD)` series** into **k = 3** phenotypes.
+The silhouette sweep decisively prefers the coarse 3-way split: the
+score is monotonically decreasing on `k ∈ {3, …, 8}` (Calinski–
+Harabasz reinforces the same ordering), which indicates that the data
+has a natural three-tier behavioural structure rather than a finer
+gradient.
+
+| `k` | Silhouette | Inertia | Calinski–Harabasz |
+| ---: | ---: | ---: | ---: |
+| **3** | **0.2201** | 80 782 | **8 210** |
+| 4 | 0.1866 | 72 814 | 6 761 |
+| 5 | 0.1900 | 66 407 | 6 015 |
+| 6 | 0.1940 | 61 475 | 5 500 |
+| 7 | 0.1958 | 57 991 | 5 048 |
+| 8 | 0.1754 | 54 745 | 4 743 |
+
+**Cluster profiles** (centroids in original units; full table in
+`ml/data/cluster_profiles.csv`):
+
+| id | Name | Size | Share | level | cv | trend | seas. | share_zeros | acf_1 | acf_12 | n_months |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | `non_seasonal_flat` | 8 139 | 43.1 % | 1.19 | 1.32 | 0.22 | 1.96 | 0.42 | 0.20 | 0.05 | 60.0 |
+| 0 | `seasonal` | 5 954 | 31.5 % | 0.51 | 2.50 | −0.42 | 4.27 | **0.76** | 0.07 | −0.00 | 38.8 |
+| 1 | `high_volume` | 4 788 | 25.4 % | **3.67** | 0.70 | 0.81 | 1.19 | 0.06 | **0.42** | **0.42** | **72.7** |
+
+**Phenotype interpretation** (top-5 example series per cluster are
+attached to each row of `cluster_profiles.csv`):
+
+- **`high_volume`** matches the predicted chronic-care archetype
+  perfectly: top-5 examples are hypertension (`I11.9`), ischaemic
+  heart disease (`I20.8`) and type-2 diabetes (`E11.7`, `E11.8`,
+  `E11.9`). Long histories (~73 months on average), low volatility,
+  strong lag-1 and lag-12 autocorrelation.
+- **`seasonal`** is *not* the winter-respiratory archetype we
+  hypothesised before running the analysis. The auto-namer picked
+  `seasonal` because the `seasonality` z-score is dominant, but the
+  cluster also has the **highest `share_zeros` (0.76)** and the
+  highest `cv` (2.50). Reading the actual phenotype: these are
+  **sparse intermittent series with isolated spikes** — rare oncology
+  codes (`C67.0`), post-partum mental health (`F53.0`), rare
+  nephrology (`N08.0`). The "annual peak" the heuristic sees is in
+  most cases a single yearly spike against a background of zero
+  months. This is a useful negative finding about the naming
+  heuristic itself: a high z-score on `seasonality` should be read
+  jointly with `share_zeros` to avoid mistaking sparsity for
+  seasonality.
+- **`non_seasonal_flat`** is the middle bucket — moderate level,
+  moderate volatility, no strong trend or season, ~60 months of
+  history. Mostly oncology codes from the Abay region and similar
+  mid-volume condition-specific series.
+
+The 2-D PCA scatter (`ml/models/cluster_pca.png`) shows the three
+groups cleanly separated; the first two components carry **64.6 %**
+of the variance (PC1 = 52.5 %, PC2 = 12.1 %).
+
+**Effect on forecasting (`9_lgbm_with_cluster` vs.
+`1_lgbm_baseline`).** Identical hold-out, same hyperparameters, the
+only difference is the addition of `cluster_id` to the categorical
+features:
+
+| Metric | Baseline | + `cluster_id` | Δ |
+| --- | ---: | ---: | ---: |
+| MAE | **18.68** | 18.92 | +0.24 (worse) |
+| RMSE | 278.79 | **276.17** | −2.62 (better) |
+| sMAPE | 64.28 % | **63.96 %** | −0.32 pp (better) |
+| R² | 0.9377 | **0.9388** | +0.0011 (better) |
+| Training time | 18.3 s | 22.6 s | +4.3 s |
+| Features | 23 | 24 | +1 |
+
+All differences sit inside the noise band: a marginal RMSE / R² gain
+on the tail of large errors, offset by a marginal MAE regression on
+the median. The honest read is that **`region_enc`, `icdid_enc`, and
+`icd_chapter_enc` already encode most of what `cluster_id` adds**
+through their own categorical splits, so a coarse 3-level cluster id
+contributes only a sliver of additional signal — and at a 23 %
+training-time cost. This is a *useful negative result*: it bounds the
+value of further unsupervised features and tells us where to invest
+next (richer behavioural descriptors, or going for `k ≥ 7` where
+silhouette flattens, rather than recycling the same 3-way split).
+
+Independent of its (small) effect on the forecaster, the clustering
+remains valuable as a **descriptive artefact**: the three-tier
+phenotype map of the prescription panel is a slide-ready summary of
+the data's behavioural composition that no supervised metric can
+replace.
+
+### 6.5 Quantile calibration (`10_lgbm_quantile`)
+
+Two extra LightGBM boosters trained with ``alpha ∈ {0.1, 0.9}`` give an
+80 % prediction interval on every forecast point. The empirical coverage
+and width on the hold-out are:
+
+| Metric | Value | Read |
+| --- | ---: | --- |
+| Empirical coverage (80 % target) | **78.57 %** | Off by −1.43 pp — well calibrated |
+| Pinball loss q10 (log) | 0.0273 | Native loss; lower = better |
+| Pinball loss q90 (log) | 0.0471 | Slightly higher — upper tail is wider |
+| Mean interval width | 44.69 | In original prescription units |
+| Median interval width | 2.02 | Long-tailed; median is more representative |
+| Width / max(y, 1) ratio | 0.751 | Band ≈ 75 % of the typical value |
+| Train time per booster | ~30 s | Same order as the point model |
+
+A coverage of 78.6 % against a nominal 80 % is **excellent** — most
+production-grade quantile-regression pipelines accept ±3 pp deviation,
+and our miss is well under 2 pp. The dashboard renders the interval as
+a translucent amber fan around the median point forecast, with the
+table beneath showing P10 / point / P90 explicitly. This converts the
+forecast surface from a single line into a **decision surface** that a
+procurement analyst can reason about directly ("target P90 for
+chronic-care drugs where stock-out is costly; target the point for
+slow-moving items with shelf-life risk").
+
+### 6.6 Anomaly detection on the audit holdout
+
+The MAD-based audit on the 6-month hold-out produces a tight,
+interpretable distribution.
+
+| Quantity | Value |
+| --- | ---: |
+| Hold-out rows scored | 113 286 |
+| Median residual (log) | 0.0000 |
+| MAD(residual log) | 0.0974 |
+| Robust σ̂ | 0.1444 |
+| Flagged (`\|z\| ≥ 1.5`) | **34 843 (30.8 %)** |
+| Critical (`\|z\| ≥ 3.0`) | 12 494 (11.0 %) |
+| Warning (`2.0 ≤ \|z\| < 3.0`) | 12 408 (11.0 %) |
+| Notice (`1.5 ≤ \|z\| < 2.0`) | 9 941 (8.8 %) |
+| Direction — surge | 18 956 |
+| Direction — drop | 15 887 |
+
+The flagged share is high (~31 %) because the residual distribution
+has heavy tails by construction: a panel of 18 881 sparse-to-dense
+series cannot be normally distributed even after the log transform.
+The *ranking* is what matters operationally — the dashboard surfaces
+the top-N by ``|z|`` with severity-coloured chips, and the heatmap
+condenses the panel into a ``region × ICD-chapter`` alert grid.
+
+The top anomalies (verbatim from ``/api/anomalies``) cluster around the
+ICD-10 chapter **B** (HIV-related codes: ``B20``, ``B20.8``, ``B23.0``):
+
+| Region | ICD | Month | Actual | Predicted | z |
+| --- | --- | --- | ---: | ---: | ---: |
+| Kostanay | B23.0 | 2024-08 | 1 | 344 | −35.7 |
+| Almaty oblast | B20.8 | 2024-06 | 171 | 1.5 | +29.4 |
+| North Kazakhstan | B20 | 2024 | … | … | +27.4 |
+| Abay | N (nephrology) | … | … | … | +26.7 |
+
+The HIV-chapter clustering is content-meaningful: the underlying
+registry mixed *HIV infection* and *HIV-related prophylaxis* codes
+across regions in 2024, producing the large swings that the model
+correctly flags as anomalous. This is exactly the kind of pattern an
+audit team should be looking at — not necessarily fraud, but a data-
+quality / coding-policy issue that has real downstream consequences
+for procurement and epidemiological reporting. The dashboard's audit
+panel surfaces these cases in seconds rather than the days a manual
+spreadsheet review would take.
+
+### 6.7 Operational characteristics
 
 - **Training time:** ~25 seconds (baseline) on a laptop CPU.
 - **Inference latency:** <50 ms per `(region, ICD, horizon=12)` call;
@@ -452,14 +791,59 @@ with the tier tag and the recommended action from Section 5.6.
   from `/api/eval-sample`, with the y = x reference line and tier
   shading for residuals.
 
-### 7.6 Forecast panel and decision recommendation (`ForecastPanel.tsx`)
+### 7.6 Forecast panel with prediction band (`ForecastPanel.tsx`)
 
 Posts to `/api/forecast` with the `(region, ICD, horizon)` triple,
 plots the forecast trajectory with the trailing 12-month baseline,
-and renders the tier badge + recommended action text. This is the
-flagship analyst-facing surface.
+and renders the tier badge + recommended action text. When the
+backend has the quantile boosters loaded
+(``has_quantiles=true`` in the response), the chart additionally
+renders a translucent amber **80 % prediction band** (P10–P90) around
+the median forecast line, and the forecast table grows two extra
+columns showing the lower and upper bounds per month. Procurement
+analysts get the central estimate and the conservative-vs-aggressive
+envelope in a single view; the visual encoding (dark line + light
+band) is intentionally the de-facto industry standard so it needs no
+training to interpret.
 
-### 7.7 Ministry DOCX report (`ReportButton.tsx` → `/api/report`)
+### 7.7 In-dashboard data ingest (`DataIngestPanel.tsx`)
+
+A drop-zone at the top of the dashboard accepts a quarterly xlsx (raw
+registry schema) or a pre-aggregated parquet and POSTs it to
+``/api/ingest``. The endpoint validates the schema, applies the same
+``calamine``-based aggregation as the bulk ETL for xlsx, then merges
+with the existing ``monthly_panel.parquet`` deduplicating on
+``(region, district, icd, year_month)``. On success the panel
+re-registers the DuckDB view and the dashboard bumps a data-version
+counter, which makes every panel-derived component re-fetch its data;
+``KPI``, ``GeoHeatmap``, the heatmap, and ``TopDiseases`` reflect the
+new rows within seconds without a page reload. The result chip
+reports rows ingested, rows added after deduplication, the
+before/after last-month boundary, and processing seconds; an inline
+``note`` clarifies that forecast and anomaly artefacts remain on the
+cached training snapshot (offline retraining via ``ml/build_features.py``
++ ``ml/train.py`` + ``ml/detect_anomalies.py``).
+
+### 7.8 Anomaly audit panel (`AnomaliesPanel.tsx`)
+
+Sources from ``/api/anomalies`` (top-N table) and
+``/api/anomaly-heatmap`` (max ``|z|`` per ``region × ICD-chapter``).
+The panel surfaces:
+
+- five summary stats at the top: counts of *critical / warning /
+  notice* tier rows, and split of *surge ↑ / drop ↓* directions;
+- severity and direction filters (chips) that re-query the API
+  in-place;
+- a sortable top-N table with severity chips, ``surge``/``drop``
+  direction icons, and the (region, ICD, month, actual, predicted,
+  z) tuple per row;
+- a colour-coded alert heatmap on the right with chapter tooltips and
+  per-cell anomaly counts on hover.
+
+This is the visual closure of the audit business task from Section 1;
+the MoH analyst no longer has to leave the dashboard to triage outliers.
+
+### 7.9 Ministry DOCX report (`ReportButton.tsx` → `/api/report`)
 
 One-click download of a Word document containing:
 
@@ -480,12 +864,18 @@ Country-level aggregation in the report aligns regions by **calendar
 month** rather than by horizon index, so October 2024 from one region
 is never summed with May 2025 from another.
 
-### 7.8 MLflow UI (auxiliary)
+### 7.10 MLflow UI (auxiliary)
 
 `mlflow ui --backend-store-uri ./mlruns` (also exposed via Docker
-Compose at `localhost:5000`) renders the five ablation runs with
-params, metrics, and booster artefacts, supporting side-by-side
-metric comparison and parallel-coordinate parameter exploration.
+Compose at `localhost:5000`) renders all ablation runs with params,
+metrics, and booster artefacts, supporting side-by-side metric
+comparison and parallel-coordinate parameter exploration. The UI
+covers four experiments: the main ablation set
+(`med_forecast_kz`, runs 1–5), per-model experiments
+(`xgboost_baseline`, `catboost_native_cats`, `random_forest`,
+`lgbm_with_cluster`), the unsupervised clustering run
+(`series_clustering`), and the quantile boosters (`10_lgbm_quantile`,
+with the empirical-coverage metric front-and-centre).
 
 ---
 

@@ -23,9 +23,12 @@ services:
       - "8000:8000"
     volumes:
       # Mount the trained model so retraining outside Docker is picked up
-      # without an image rebuild.
+      # without an image rebuild. ``ml/data`` is read-write because the
+      # /api/ingest endpoint (UI upload) writes the appended monthly_panel
+      # back to disk; ``ml/models`` stays read-only — the booster artefacts
+      # are produced offline by ml/train*.py.
       - ./ml/models:/app/ml/models:ro
-      - ./ml/data:/app/ml/data:ro
+      - ./ml/data:/app/ml/data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 15s
@@ -37,11 +40,16 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      # `rewrites()` is evaluated at `next build` time, so the proxy target
+      # must be available as a build-arg, not just a runtime env.
+      args:
+        BACKEND_URL: http://backend:8000
     image: med-forecast-frontend
     container_name: med-forecast-frontend
     environment:
-      # The frontend's next.config.js proxies /api/* to NEXT_PUBLIC_API_URL.
-      # Inside the Compose network the backend is reachable as `backend`.
+      # Runtime fallback / parity with build-arg — keeps the image portable
+      # if BACKEND_URL ever moves to true-runtime resolution.
+      - BACKEND_URL=http://backend:8000
       - NEXT_PUBLIC_API_URL=http://backend:8000
     depends_on:
       backend:
