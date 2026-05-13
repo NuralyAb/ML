@@ -2127,5 +2127,18 @@
   "last_observed_month": "2025-04-01",
   "n_train_rows": 727408,
   "n_test_rows": 113286,
-  "n_series": 18881
+  "n_series": 18881,
+  "quantile_model_paths": {
+    "q10": "lgbm_recipe_forecast_q10.txt",
+    "q90": "lgbm_recipe_forecast_q90.txt"
+  },
+  "quantile_metrics": {
+    "pinball_loss_q10_log": 0.02728072926250117,
+    "pinball_loss_q90_log": 0.04712251278349774,
+    "empirical_coverage_80": 0.7857193298377557,
+    "mean_interval_width": 44.68879157530203,
+    "median_interval_width": 2.0221321500102323,
+    "width_to_value_ratio": 0.7508564792907679
+  },
+  "quantile_trained_at": "2026-05-13T20:49:42.013027+00:00"
 }
