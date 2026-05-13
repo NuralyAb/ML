@@ -60,9 +60,19 @@ export function ForecastPanel({
     const pts: HistPoint[] = resp.history.map((h) => ({ month: h.year_month, actual: h.actual }));
     if (resp.forecast.length) {
       const lastActual = pts[pts.length - 1];
-      pts.push({ month: lastActual.month, predicted: lastActual.actual });
+      // Stitch the band to the last actual so the fan starts from the known
+      // observation rather than appearing as a floating shape.
+      pts.push({
+        month: lastActual.month,
+        predicted: lastActual.actual,
+        band: resp.has_quantiles ? [lastActual.actual ?? 0, lastActual.actual ?? 0] : undefined,
+      });
       for (const f of resp.forecast) {
-        pts.push({ month: f.year_month, predicted: f.predicted });
+        pts.push({
+          month: f.year_month,
+          predicted: f.predicted,
+          band: f.lower !== undefined && f.upper !== undefined ? [f.lower, f.upper] : undefined,
+        });
       }
     }
     return pts;
@@ -178,21 +188,32 @@ export function ForecastPanel({
 }
 
 function ForecastTable({ resp }: { resp: ForecastResponse }) {
+  const showBand = resp.has_quantiles;
   return (
     <div className="panel-soft p-4">
-      <div className="text-sm text-ink-800 mb-2 font-semibold">Прогноз по месяцам</div>
+      <div className="text-sm text-ink-800 mb-2 font-semibold">
+        Прогноз по месяцам{showBand && <span className="ml-2 text-ink-500 font-normal">· 80% интервал (P10–P90)</span>}
+      </div>
       <table className="w-full text-sm">
         <thead className="text-ink-500 text-xs uppercase tracking-wider">
           <tr>
             <th className="text-left pb-2">Месяц</th>
-            <th className="text-right pb-2">Прогноз рецептов</th>
+            {showBand && <th className="text-right pb-2">P10</th>}
+            <th className="text-right pb-2">Прогноз</th>
+            {showBand && <th className="text-right pb-2">P90</th>}
           </tr>
         </thead>
         <tbody>
           {resp.forecast.map((f) => (
             <tr key={f.year_month} className="border-t border-line">
               <td className="py-1.5 text-ink-900">{fmtMonth(f.year_month)}</td>
+              {showBand && (
+                <td className="py-1.5 text-right text-ink-500">{f.lower !== undefined ? fmtInt(f.lower) : "—"}</td>
+              )}
               <td className="py-1.5 text-right font-bold text-ink-900">{fmtInt(f.predicted)}</td>
+              {showBand && (
+                <td className="py-1.5 text-right text-ink-500">{f.upper !== undefined ? fmtInt(f.upper) : "—"}</td>
+              )}
             </tr>
           ))}
         </tbody>

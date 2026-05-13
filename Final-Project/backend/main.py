@@ -9,24 +9,27 @@ FastAPI entry point. Endpoints power the Next.js dashboard:
   GET /api/region-summary?icd=                  -> per-region totals (latest 12 months)
   GET /api/heatmap?metric=&period=              -> heatmap matrix region × icd_chapter
   GET /api/top-diseases?region=&period=         -> ranked ICD codes
-  POST /api/forecast {region, icd, horizon}     -> recursive multi-step forecast
+  POST /api/forecast {region, icd, horizon}     -> recursive multi-step forecast (+ P10/P90 band)
   GET /api/model-metrics                        -> training metadata + holdout metrics
   GET /api/eval-sample?n=                       -> sample of holdout actual vs predicted
   GET /api/global-stats                         -> high-level dataset stats
+  GET /api/anomalies                            -> ranked (region, icd, month) outliers on holdout
+  GET /api/anomaly-heatmap                      -> max |z| per (region, icd-chapter) cell
+  POST /api/ingest  (multipart file)            -> append fresh xlsx/parquet into monthly_panel
 """
 from __future__ import annotations
-import os, json, threading
+import io, os, json, time, threading
 from datetime import datetime
 from typing import Optional
 
 import duckdb
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from inference import get_forecaster
+from inference import get_forecaster, reset_forecaster
 from report import build_forecast_rows, llm_executive_summary, render_docx
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +39,8 @@ PANEL = os.path.join(DATA_DIR, "monthly_panel.parquet")
 META = os.path.join(MODEL_DIR, "metadata.json")
 EVAL = os.path.join(MODEL_DIR, "eval_predictions.parquet")
 SERIES_META = os.path.join(DATA_DIR, "series_meta.parquet")
+ANOMALIES_FILE = os.path.join(DATA_DIR, "anomalies.parquet")
+ANOMALIES_META = os.path.join(MODEL_DIR, "anomalies_meta.json")
 
 app = FastAPI(title="Kazakhstan Prescription Forecasting API", version="1.0")
 
@@ -392,6 +397,8 @@ def forecast(req: ForecastRequest):
         "horizon": req.horizon,
         "history": history_out,
         "forecast": pred_df.drop(columns=["nozology"]).to_dict(orient="records"),
+        # True iff quantile boosters are loaded — UI can render the fan band.
+        "has_quantiles": fc.has_quantiles,
     }
 
 
@@ -417,6 +424,244 @@ def eval_sample(n: int = 200, region: Optional[str] = None):
     df = df.sample(min(n, len(df)), random_state=0).copy()
     df["year_month"] = pd.to_datetime(df["year_month"]).dt.strftime("%Y-%m-%d")
     return df.to_dict(orient="records")
+
+
+@app.get("/api/anomalies")
+def anomalies(
+    limit: int = 50,
+    min_z: float = 1.5,
+    region: Optional[str] = None,
+    direction: Optional[str] = None,
+    severity: Optional[str] = None,
+):
+    """Top-N anomalies from the holdout audit (see ml/detect_anomalies.py).
+
+    Filters are AND-combined. ``direction`` is one of ``surge`` / ``drop``
+    (positive vs negative residual). ``severity`` is ``critical`` /
+    ``warning`` / ``notice``.
+    """
+    if not os.path.exists(ANOMALIES_FILE):
+        return {"meta": {"available": False}, "rows": []}
+    df = pd.read_parquet(ANOMALIES_FILE)
+    if region:
+        df = df[df["region"] == region]
+    if direction:
+        df = df[df["direction"] == direction]
+    if severity:
+        df = df[df["severity"] == severity]
+    df = df[df["abs_z"] >= float(min_z)]
+    df = df.sort_values("abs_z", ascending=False).head(int(limit)).copy()
+    meta = {"available": True}
+    if os.path.exists(ANOMALIES_META):
+        with open(ANOMALIES_META, "r", encoding="utf-8") as f:
+            meta.update(json.load(f))
+    return {"meta": meta, "rows": df.to_dict(orient="records")}
+
+
+@app.get("/api/anomaly-heatmap")
+def anomaly_heatmap():
+    """Aggregate audit signal across (region, icd_chapter) cells: returns the
+    maximum |z| per cell so the dashboard can colour the grid by the most
+    severe anomaly observed in each combination.
+    """
+    if not os.path.exists(ANOMALIES_FILE):
+        return []
+    df = pd.read_parquet(ANOMALIES_FILE)
+    if df.empty:
+        return []
+    grid = (
+        df.groupby(["region", "icd_chapter"], as_index=False)
+          .agg(
+              max_abs_z=("abs_z", "max"),
+              n=("abs_z", "size"),
+              n_surge=("direction", lambda s: int((s == "surge").sum())),
+              n_drop=("direction", lambda s: int((s == "drop").sum())),
+          )
+          .sort_values("max_abs_z", ascending=False)
+    )
+    return grid.to_dict(orient="records")
+
+
+# ---------------------------------------------------------------------------
+# Data ingestion (UI upload → append to monthly_panel)
+# ---------------------------------------------------------------------------
+
+# Cap upload size to keep the request synchronous and bound memory use.
+INGEST_MAX_BYTES = 100 * 1024 * 1024              # 100 MB
+INGEST_REQUIRED_COLS = {"region", "icdid", "year_month", "recipe_count"}
+INGEST_RAW_COLS = {
+    "recipedate", "icdid", "nozology",
+    "region_med_organ", "raion_med_organ",
+    "recipepackqty", "polyclid",
+}
+
+
+def _aggregate_raw(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate a raw prescription dataframe to monthly_panel schema.
+
+    Mirrors ml/prepare_data.py::aggregate_file so a single uploaded xlsx is
+    processed identically to the bulk ETL. Kept inline so backend/ stays
+    self-contained (the ml/ scripts are not in the backend image).
+    """
+    df = df.copy()
+    df["recipedate"] = pd.to_datetime(df["recipedate"], errors="coerce")
+    df = df.dropna(subset=["recipedate", "icdid", "region_med_organ"])
+    df["year_month"] = df["recipedate"].dt.to_period("M").dt.to_timestamp()
+    df["icdid"] = df["icdid"].astype("string").str.strip()
+    df["nozology"] = df.get("nozology", pd.Series(dtype="string")).astype("string").str.strip().fillna("Unknown")
+    df["region"] = df["region_med_organ"].astype("string").str.strip()
+    df["district"] = df.get("raion_med_organ", pd.Series(dtype="string")).astype("string").str.strip().fillna("Unknown")
+    df["recipepackqty"] = pd.to_numeric(df.get("recipepackqty"), errors="coerce").fillna(1)
+    if "polyclid" not in df.columns:
+        df["polyclid"] = 0
+    return (
+        df.groupby(["region", "district", "icdid", "nozology", "year_month"], dropna=False)
+          .agg(
+              recipe_count=("icdid", "size"),
+              total_packs=("recipepackqty", "sum"),
+              n_clinics=("polyclid", "nunique"),
+          )
+          .reset_index()
+    )
+
+
+def _refresh_duckdb_panel():
+    """Re-register the parquet view so subsequent SELECTs see the new file."""
+    with _db_lock:
+        _con.execute(f"CREATE OR REPLACE VIEW panel AS SELECT * FROM '{PANEL.replace(chr(92), '/')}'")
+        if os.path.exists(SERIES_META):
+            _con.execute(f"CREATE OR REPLACE VIEW series_meta AS SELECT * FROM '{SERIES_META.replace(chr(92), '/')}'")
+
+
+@app.post("/api/ingest")
+async def ingest(file: UploadFile = File(...)):
+    """Append a fresh xlsx or parquet snapshot to the monthly panel.
+
+    Accepts:
+      * raw quarterly xlsx with the source registry schema
+        (columns: ``recipedate, icdid, nozology, region_med_organ,
+        raion_med_organ, recipepackqty, polyclid``) — aggregated inline
+        with the same logic as ``ml/prepare_data.py``.
+      * pre-aggregated parquet with the monthly_panel schema
+        (``region, district, icdid, nozology, year_month, recipe_count,
+        total_packs, n_clinics``).
+
+    Dedupes by ``(region, district, icdid, year_month)``, summing counts
+    so that an overlapping upload doesn't double-count. Returns a JSON
+    summary of the operation.
+
+    Note: ``feature_panel.parquet``, the LightGBM booster, and the
+    anomaly artefact are **not** rebuilt here — those are offline jobs
+    triggered via ``ml/build_features.py`` + ``ml/train.py`` +
+    ``ml/detect_anomalies.py``. The dashboard's KPI / map / heatmap /
+    top-diseases panels (which read ``monthly_panel`` directly) update
+    immediately; the forecast / anomaly panels stay on the cached
+    training snapshot until a retraining run.
+    """
+    if not os.path.exists(PANEL):
+        raise HTTPException(503, "monthly_panel.parquet not found on server")
+
+    filename = (file.filename or "upload").lower()
+    body = await file.read()
+    if len(body) > INGEST_MAX_BYTES:
+        raise HTTPException(413, f"file too large ({len(body)/1e6:.1f} MB, limit {INGEST_MAX_BYTES/1e6:.0f} MB)")
+    if len(body) == 0:
+        raise HTTPException(400, "empty upload")
+
+    t0 = time.time()
+    # ---- 1. Parse upload into the monthly_panel schema ----
+    try:
+        if filename.endswith(".parquet"):
+            uploaded = pd.read_parquet(io.BytesIO(body))
+            missing = INGEST_REQUIRED_COLS.difference(uploaded.columns)
+            if missing:
+                raise HTTPException(400, f"parquet missing required columns: {sorted(missing)}")
+            uploaded["year_month"] = pd.to_datetime(uploaded["year_month"], errors="coerce")
+            uploaded = uploaded.dropna(subset=["year_month", "icdid", "region"]).copy()
+            for col, default in (("district", "Unknown"), ("nozology", "Unknown"),
+                                 ("total_packs", uploaded.get("recipe_count")),
+                                 ("n_clinics", 0)):
+                if col not in uploaded.columns:
+                    uploaded[col] = default
+            uploaded = uploaded[["region", "district", "icdid", "nozology", "year_month",
+                                 "recipe_count", "total_packs", "n_clinics"]]
+            source_kind = "parquet"
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            try:
+                raw = pd.read_excel(io.BytesIO(body),
+                                    usecols=lambda c: c in INGEST_RAW_COLS,
+                                    engine="calamine")
+            except Exception:
+                raw = pd.read_excel(io.BytesIO(body),
+                                    usecols=lambda c: c in INGEST_RAW_COLS,
+                                    engine="openpyxl")
+            missing = {"recipedate", "icdid", "region_med_organ"}.difference(raw.columns)
+            if missing:
+                raise HTTPException(400, f"xlsx missing required columns: {sorted(missing)}")
+            uploaded = _aggregate_raw(raw)
+            source_kind = "xlsx"
+        else:
+            raise HTTPException(415, f"unsupported file type: {filename!r}; accept .xlsx / .parquet")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"failed to parse {source_kind if 'source_kind' in locals() else 'file'}: {e}")
+
+    if uploaded.empty:
+        raise HTTPException(400, "upload produced 0 valid rows after cleaning")
+
+    # ---- 2. Merge with the existing panel ----
+    existing = pd.read_parquet(PANEL)
+    rows_before = int(len(existing))
+    last_before = pd.to_datetime(existing["year_month"]).max()
+    uploaded["year_month"] = pd.to_datetime(uploaded["year_month"])
+
+    combined = pd.concat([existing, uploaded], ignore_index=True)
+    merged = (
+        combined.groupby(["region", "district", "icdid", "nozology", "year_month"], as_index=False)
+                .agg(recipe_count=("recipe_count", "sum"),
+                     total_packs=("total_packs", "sum"),
+                     n_clinics=("n_clinics", "max"))
+                .sort_values(["region", "district", "icdid", "year_month"])
+                .reset_index(drop=True)
+    )
+    rows_after = int(len(merged))
+    rows_added = rows_after - rows_before
+    last_after = merged["year_month"].max()
+    regions_in_upload = sorted(uploaded["region"].dropna().unique().tolist())
+
+    # ---- 3. Atomic write + view refresh ----
+    tmp = PANEL + ".tmp"
+    merged.to_parquet(tmp, index=False)
+    os.replace(tmp, PANEL)
+    _refresh_duckdb_panel()
+    # The Forecaster also caches feature_panel.parquet in memory and would
+    # miss the new rows; reset so the next /api/forecast call re-loads.
+    try:
+        reset_forecaster()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "source_kind": source_kind,
+        "filename": file.filename,
+        "size_bytes": len(body),
+        "rows_in_upload": int(len(uploaded)),
+        "rows_before": rows_before,
+        "rows_added": rows_added,
+        "rows_after": rows_after,
+        "last_month_before": last_before.strftime("%Y-%m-%d") if pd.notna(last_before) else None,
+        "last_month_after": last_after.strftime("%Y-%m-%d") if pd.notna(last_after) else None,
+        "regions_in_upload": regions_in_upload,
+        "processing_seconds": round(time.time() - t0, 2),
+        "note": (
+            "monthly_panel updated; KPI/map/heatmap/top-diseases reflect new "
+            "data immediately. Forecast and anomaly artefacts stay on the "
+            "cached training snapshot until ml/build_features.py + ml/train.py "
+            "+ ml/detect_anomalies.py are rerun."
+        ),
+    }
 
 
 @app.get("/api/global-stats")

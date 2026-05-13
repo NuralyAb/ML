@@ -9,6 +9,14 @@ export type HistPoint = {
   month: string;
   actual?: number;
   predicted?: number;
+  /** Pair of (lower, upper) quantile bounds for the forecast band. */
+  band?: [number, number];
+};
+
+const LEGEND_LABELS: Record<string, string> = {
+  actual: "Факт",
+  predicted: "Прогноз",
+  band: "Интервал 80% (P10–P90)",
 };
 
 export function HistoricalChart({
@@ -20,6 +28,7 @@ export function HistoricalChart({
   splitAt?: string;
   title?: string;
 }) {
+  const hasBand = data.some((d) => Array.isArray(d.band));
   return (
     <div className="h-[330px]">
       {title && <div className="mb-1 text-sm text-ink-700 font-medium">{title}</div>}
@@ -61,12 +70,17 @@ export function HistoricalChart({
               boxShadow: "0 12px 32px -12px rgba(15,23,42,0.15)",
             }}
             labelFormatter={fmtMonth}
-            formatter={(v: number, name: string) => [fmtInt(v), name === "actual" ? "Факт" : "Прогноз"]}
+            formatter={(v: number | [number, number], name: string) => {
+              if (name === "band" && Array.isArray(v)) {
+                return [`${fmtInt(v[0])} – ${fmtInt(v[1])}`, LEGEND_LABELS.band];
+              }
+              return [fmtInt(v as number), LEGEND_LABELS[name] ?? name];
+            }}
           />
           <Legend
             iconType="plainline"
             wrapperStyle={{ fontSize: 11, color: "#64748b" }}
-            formatter={(v) => (v === "actual" ? "Факт" : "Прогноз")}
+            formatter={(v) => LEGEND_LABELS[v] ?? v}
           />
           {splitAt && (
             <ReferenceLine
@@ -74,6 +88,17 @@ export function HistoricalChart({
               stroke="#f59e0b"
               strokeDasharray="4 4"
               label={{ value: "→ прогноз", fill: "#b45309", fontSize: 10, position: "top" }}
+            />
+          )}
+          {/* Quantile band first so the point line + actuals draw on top. */}
+          {hasBand && (
+            <Area
+              type="monotone"
+              dataKey="band"
+              stroke="none"
+              fill="#fbbf24"
+              fillOpacity={0.22}
+              isAnimationActive={false}
             />
           )}
           <Area type="monotone" dataKey="actual" stroke="#2563eb" fill="url(#hist)" strokeWidth={2.2} />

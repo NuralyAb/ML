@@ -18,6 +18,11 @@ MODEL_DIR = os.path.join(ROOT, "ml", "models")
 MODEL_FILE = os.path.join(MODEL_DIR, "lgbm_recipe_forecast.txt")
 META_FILE = os.path.join(MODEL_DIR, "metadata.json")
 FEATURES_FILE = os.path.join(DATA_DIR, "feature_panel.parquet")
+# Optional quantile boosters produced by ml/train_quantile.py. When present,
+# /api/forecast returns an 80% prediction interval (P10..P90) alongside the
+# point estimate. When absent, the API gracefully degrades to point-only.
+Q10_FILE = os.path.join(MODEL_DIR, "lgbm_recipe_forecast_q10.txt")
+Q90_FILE = os.path.join(MODEL_DIR, "lgbm_recipe_forecast_q90.txt")
 
 
 class Forecaster:
@@ -34,10 +39,21 @@ class Forecaster:
             col: {v: i for i, v in enumerate(self.meta["encoder_classes"][col])}
             for col in self.cat_cols
         }
+        # Quantile boosters are optional — load only if both files are present
+        # so the API surface stays uniform (either both bounds or neither).
+        self.booster_q10: lgb.Booster | None = None
+        self.booster_q90: lgb.Booster | None = None
+        if os.path.exists(Q10_FILE) and os.path.exists(Q90_FILE):
+            self.booster_q10 = lgb.Booster(model_file=Q10_FILE)
+            self.booster_q90 = lgb.Booster(model_file=Q90_FILE)
         # Cached history at (region, icdid, year_month) for fast lookups.
         self._history = pd.read_parquet(FEATURES_FILE)
         self._history["year_month"] = pd.to_datetime(self._history["year_month"])
         self.last_month = self._history["year_month"].max()
+
+    @property
+    def has_quantiles(self) -> bool:
+        return self.booster_q10 is not None and self.booster_q90 is not None
 
     # --- public helpers -------------------------------------------------
 
@@ -105,11 +121,25 @@ class Forecaster:
             X = pd.DataFrame([row])[self.features]
             yhat_log = float(self.booster.predict(X)[0])
             yhat = max(0.0, float(np.expm1(yhat_log)))
-            out_rows.append({
+            row_out = {
                 "year_month": target_month.strftime("%Y-%m-%d"),
                 "predicted": round(yhat, 2),
                 "nozology": nozology,
-            })
+            }
+            if self.has_quantiles:
+                lo_log = float(self.booster_q10.predict(X)[0])
+                hi_log = float(self.booster_q90.predict(X)[0])
+                lo = max(0.0, float(np.expm1(lo_log)))
+                hi = max(0.0, float(np.expm1(hi_log)))
+                # Quantile bounds may cross when the boosters disagree on
+                # very sparse series — clamp so lower <= point <= upper.
+                lo = min(lo, yhat)
+                hi = max(hi, yhat)
+                row_out["lower"] = round(lo, 2)
+                row_out["upper"] = round(hi, 2)
+            out_rows.append(row_out)
+            # Recursion uses the *point* prediction so future features aren't
+            # biased toward an optimistic or pessimistic envelope.
             values.append(yhat)
 
         return pd.DataFrame(out_rows)
@@ -131,3 +161,12 @@ def get_forecaster() -> Forecaster:
     if _INSTANCE is None:
         _INSTANCE = Forecaster()
     return _INSTANCE
+
+
+def reset_forecaster() -> None:
+    """Drop the cached Forecaster so the next ``get_forecaster()`` re-reads
+    ``feature_panel.parquet`` and the booster files from disk. Called after
+    ``/api/ingest`` so any retrained model on the host is picked up without
+    a backend restart."""
+    global _INSTANCE
+    _INSTANCE = None

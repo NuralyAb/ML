@@ -60,7 +60,67 @@ export type ForecastResponse = {
   nozology: string;
   horizon: number;
   history: { year_month: string; actual: number }[];
-  forecast: { year_month: string; predicted: number }[];
+  /**
+   * Per-month forecast. ``lower``/``upper`` are present when the backend
+   * has quantile boosters loaded (see ml/train_quantile.py). They define an
+   * 80 % prediction interval — render as a band around ``predicted``.
+   */
+  forecast: { year_month: string; predicted: number; lower?: number; upper?: number }[];
+  has_quantiles?: boolean;
+};
+
+export type AnomalyRow = {
+  region: string;
+  icdid: string;
+  nozology: string | null;
+  icd_chapter: string;
+  year_month: string;
+  actual: number;
+  predicted: number;
+  residual: number;
+  residual_log: number;
+  z_score: number;
+  abs_z: number;
+  direction: "surge" | "drop";
+  severity: "critical" | "warning" | "notice";
+};
+
+export type AnomaliesResponse = {
+  meta: {
+    available: boolean;
+    n_panel_rows?: number;
+    n_flagged?: number;
+    share_flagged?: number;
+    tiers?: Record<string, number>;
+    directions?: Record<string, number>;
+    computed_at?: string;
+  };
+  rows: AnomalyRow[];
+};
+
+export type AnomalyHeatCell = {
+  region: string;
+  icd_chapter: string;
+  max_abs_z: number;
+  n: number;
+  n_surge: number;
+  n_drop: number;
+};
+
+export type IngestResponse = {
+  ok: boolean;
+  source_kind: "xlsx" | "parquet";
+  filename: string;
+  size_bytes: number;
+  rows_in_upload: number;
+  rows_before: number;
+  rows_added: number;
+  rows_after: number;
+  last_month_before: string | null;
+  last_month_after: string | null;
+  regions_in_upload: string[];
+  processing_seconds: number;
+  note: string;
 };
 
 export type ModelMetrics = {
@@ -168,4 +228,27 @@ export const api = {
     post<ForecastResponse>("/api/forecast", { region, icd, horizon }),
   modelMetrics:     () => get<ModelMetrics>("/api/model-metrics"),
   globalStats:      () => get<GlobalStats>("/api/global-stats"),
+  anomalies:        (opts?: { limit?: number; min_z?: number; region?: string; direction?: "surge" | "drop"; severity?: "critical" | "warning" | "notice" }) => {
+    const { limit = 50, min_z = 1.5, region, direction, severity } = opts || {};
+    const parts = [`limit=${limit}`, `min_z=${min_z}`];
+    if (region) parts.push(`region=${encodeURIComponent(region)}`);
+    if (direction) parts.push(`direction=${direction}`);
+    if (severity) parts.push(`severity=${severity}`);
+    return get<AnomaliesResponse>(`/api/anomalies?${parts.join("&")}`);
+  },
+  anomalyHeatmap:   () => get<AnomalyHeatCell[]>("/api/anomaly-heatmap"),
+  ingest:           async (file: File): Promise<IngestResponse> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/ingest", { method: "POST", body: fd, cache: "no-store" });
+    if (!r.ok) {
+      let detail = `${r.status} ${r.statusText}`;
+      try {
+        const j = await r.json();
+        if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch { /* ignore */ }
+      throw new Error(detail);
+    }
+    return (await r.json()) as IngestResponse;
+  },
 };

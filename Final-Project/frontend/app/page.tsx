@@ -12,6 +12,8 @@ import { TopDiseases } from "@/components/TopDiseases";
 import { ForecastPanel } from "@/components/ForecastPanel";
 import { ModelMetricsCard } from "@/components/ModelMetricsCard";
 import { EvalScatter } from "@/components/EvalScatter";
+import { AnomaliesPanel } from "@/components/AnomaliesPanel";
+import { DataIngestPanel } from "@/components/DataIngestPanel";
 import { GeoHeatmap } from "@/components/GeoHeatmap";
 import { HistoricalChart } from "@/components/HistoricalChart";
 import { fmtInt, fmtMonth } from "@/lib/format";
@@ -27,8 +29,10 @@ export default function Page() {
   const [overview, setOverview] = useState<{ month: string; total: number }[]>([]);
   const [regionTotals, setRegionTotals] = useState<RegionTotal[]>([]);
   const [heatmap, setHeatmap] = useState<HeatmapCell[]>([]);
+  // Bumped after a successful /api/ingest so all panel-derived data refetches.
+  const [dataVersion, setDataVersion] = useState(0);
 
-  // Initial fetch
+  // Initial fetch (and refetch on data-version bump after ingest).
   useEffect(() => {
     Promise.all([
       api.globalStats().catch(() => null),
@@ -40,14 +44,15 @@ export default function Page() {
       setRegions(rs);
       setHeatmap(hm);
       setRegionTotals(rt);
-      if (rs.length) setSelectedRegion(rs[0].region);
+      if (rs.length && !selectedRegion) setSelectedRegion(rs[0].region);
     });
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataVersion]);
 
   // Region-dependent timeseries.
   useEffect(() => {
     api.timeseriesOverview(selectedRegion ?? undefined).then(setOverview).catch(() => setOverview([]));
-  }, [selectedRegion]);
+  }, [selectedRegion, dataVersion]);
 
   const totalLast = useMemo(() => {
     if (!overview.length) return 0;
@@ -158,6 +163,11 @@ export default function Page() {
           </div>
         </section>
 
+        {/* Data ingest (xlsx / parquet → monthly_panel) */}
+        <section className="mt-6">
+          <DataIngestPanel onIngested={() => setDataVersion((v) => v + 1)} />
+        </section>
+
         {/* Geographic heatmap of Kazakhstan */}
         <section className="mt-6">
           <GeoHeatmap
@@ -212,6 +222,11 @@ export default function Page() {
         <section className="mt-6 grid gap-5 lg:grid-cols-12">
           <div className="lg:col-span-7"><ModelMetricsCard /></div>
           <div className="lg:col-span-5"><EvalScatter /></div>
+        </section>
+
+        {/* Anomaly audit panel */}
+        <section className="mt-6">
+          <AnomaliesPanel />
         </section>
 
         <footer className="mt-10 flex flex-wrap items-center justify-between gap-3 text-xs text-ink-500">
