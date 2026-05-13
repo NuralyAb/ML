@@ -1,6 +1,6 @@
 PY ?= python
 
-.PHONY: install etl features train backend frontend all
+.PHONY: install etl features train cluster backend frontend all
 
 install:
 	$(PY) -m pip install -r backend/requirements.txt python-calamine
@@ -14,7 +14,10 @@ features:
 train:
 	$(PY) ml/train.py
 
-pipeline: etl features train
+cluster:
+	$(PY) ml/cluster_series.py
+
+pipeline: etl features train cluster
 
 backend:
 	cd backend && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
