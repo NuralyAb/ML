@@ -20,12 +20,23 @@ const MONTH_LABELS = [
  */
 export function SeasonalityChart({ data }: { data: SeasonalityResponse }) {
   const chartData = useMemo(() => {
-    return data.monthly.map((m) => ({
+    // Cyclic 3-month centered moving average so January smooths against
+    // December + February (seasonal data wraps around the year).
+    const avgs = data.monthly.map((m) => m.avg);
+    const n = avgs.length;
+    const trend = avgs.map((_, i) => {
+      const prev = avgs[(i - 1 + n) % n];
+      const next = avgs[(i + 1) % n];
+      return (prev + avgs[i] + next) / 3;
+    });
+
+    return data.monthly.map((m, i) => ({
       month: MONTH_LABELS[m.month - 1],
       avg: Math.round(m.avg),
       median: Math.round(m.median),
       min: m.min,
       max: m.max,
+      trend: Math.round(trend[i]),
       // Make the range visible as a "candle" using bottom + height
       rangeBase: m.min,
       rangeSize: Math.max(0, m.max - m.min),
@@ -84,6 +95,7 @@ export function SeasonalityChart({ data }: { data: SeasonalityResponse }) {
                   <div className="font-semibold text-ink-900">{d.month}</div>
                   <div className="mt-1 text-ink-700">Average: <b>{fmtInt(d.avg)}</b></div>
                   <div className="text-ink-700">Median: {fmtInt(d.median)}</div>
+                  <div className="text-ink-700">Trend (3-mo MA): {fmtInt(d.trend)}</div>
                   <div className="text-ink-500">Range: {fmtInt(d.min)} – {fmtInt(d.max)}</div>
                 </div>
               );
@@ -95,6 +107,7 @@ export function SeasonalityChart({ data }: { data: SeasonalityResponse }) {
             payload={[
               { value: "Range (min–max across years)", type: "rect", color: "#cbd5e1", id: "range" },
               { value: "Monthly average", type: "rect", color: "#2563eb", id: "avg" },
+              { value: "Trend (3-month MA, cyclic)", type: "line", color: "#0f766e", id: "trend" },
               { value: "Overall mean (dashed)", type: "rect", color: "#c47c1b", id: "mean" },
             ]}
           />
@@ -105,6 +118,18 @@ export function SeasonalityChart({ data }: { data: SeasonalityResponse }) {
           <Bar dataKey="rangeSize" stackId="range" fill="#cbd5e1" radius={[2, 2, 0, 0]} isAnimationActive={false} name="Range" />
           {/* The actual monthly average on top of the range. */}
           <Bar dataKey="avg" fill="#2563eb" barSize={18} radius={[3, 3, 0, 0]} name="Monthly avg" />
+          {/* Smoothed trend line on top of the bars: cyclic 3-month centered
+              moving average. Makes the seasonal wave visible at a glance. */}
+          <Line
+            type="monotone"
+            dataKey="trend"
+            stroke="#0f766e"
+            strokeWidth={2.5}
+            dot={{ r: 3, fill: "#0f766e", stroke: "#ffffff", strokeWidth: 1.5 }}
+            activeDot={{ r: 5 }}
+            isAnimationActive={false}
+            name="Trend"
+          />
           <ReferenceLine
             y={overallMean}
             stroke="#c47c1b"
