@@ -16,6 +16,7 @@ import { AnomaliesPanel } from "@/components/AnomaliesPanel";
 import { DataIngestPanel } from "@/components/DataIngestPanel";
 import { GeoHeatmap } from "@/components/GeoHeatmap";
 import { HistoricalChart } from "@/components/HistoricalChart";
+import { SeasonalityPanel } from "@/components/SeasonalityPanel";
 import { fmtInt, fmtMonth } from "@/lib/format";
 
 import type { GlobalStats, HeatmapCell, RegionRow, RegionTotal } from "@/lib/api";
@@ -196,6 +197,17 @@ export default function Page() {
               regions={regions}
               initialRegion={selectedRegion ?? undefined}
               initialIcd={selectedIcd ?? undefined}
+            />
+          )}
+        </section>
+
+        {/* Disease seasonality (monthly profile across years) */}
+        <section className="mt-6">
+          {regions.length > 0 && (
+            <SeasonalityPanel
+              regions={regions}
+              initialRegion={selectedRegion}
+              initialIcd={selectedIcd}
             />
           )}
         </section>

@@ -367,6 +367,86 @@ def timeseries_overview(region: Optional[str] = None):
     return [{"month": r[0].strftime("%Y-%m-%d"), "total": int(r[1])} for r in rows]
 
 
+@app.get("/api/seasonality")
+def seasonality(icd: str, region: Optional[str] = None):
+    """Calendar-month seasonal profile of a diagnosis.
+
+    Aggregates the actual `recipe_count` series by calendar month (1..12)
+    across all available years, returning per-month average, min, max,
+    median and the per-year breakdown for overlay charts. This is the
+    chart that lets a user *see* the seasonal pattern the model is
+    already encoding through its `month`, `month_sin/cos`, `lag_12`, and
+    `roll_mean_12` features.
+    """
+    where = ["icdid = ?"]
+    params: list = [icd]
+    if region:
+        where.append("region = ?")
+        params.append(region)
+    where_sql = " AND ".join(where)
+
+    # First, fetch the monthly totals (sum across regions if no filter, or
+    # across districts within a single region if filter is set).
+    rows = query(
+        f"SELECT year_month, SUM(recipe_count) AS total, ANY_VALUE(nozology) AS nz "
+        f"FROM panel WHERE {where_sql} GROUP BY year_month ORDER BY year_month",
+        params,
+    )
+    if not rows:
+        raise HTTPException(404, "no data for this region/icd")
+
+    # Build per-year × month matrix and the average-of-averages summary.
+    import statistics
+    by_month: dict[int, list[int]] = {m: [] for m in range(1, 13)}
+    per_year: dict[int, dict[int, int]] = {}
+    for r in rows:
+        ym, total, _ = r
+        y, m = ym.year, ym.month
+        by_month[m].append(int(total))
+        per_year.setdefault(y, {})[m] = int(total)
+
+    monthly = []
+    for m in range(1, 13):
+        vals = by_month[m]
+        if vals:
+            monthly.append({
+                "month": m,
+                "avg":  float(sum(vals) / len(vals)),
+                "min":  int(min(vals)),
+                "max":  int(max(vals)),
+                "median": float(statistics.median(vals)),
+                "n_years": len(vals),
+            })
+        else:
+            monthly.append({"month": m, "avg": 0.0, "min": 0, "max": 0,
+                            "median": 0.0, "n_years": 0})
+
+    yearly = [
+        {"year": y, "values": [per_year[y].get(m, 0) for m in range(1, 13)]}
+        for y in sorted(per_year)
+    ]
+
+    # Seasonality strength: coefficient of variation of monthly averages.
+    monthly_avgs = [m["avg"] for m in monthly if m["n_years"] > 0]
+    if monthly_avgs:
+        mean = sum(monthly_avgs) / len(monthly_avgs)
+        std = (sum((v - mean) ** 2 for v in monthly_avgs) / len(monthly_avgs)) ** 0.5
+        cv = float(std / mean) if mean > 0 else 0.0
+    else:
+        cv = 0.0
+
+    nozology = rows[0][2] or ""
+    return {
+        "icd": icd,
+        "region": region,
+        "nozology": nozology,
+        "n_years": len({ym.year for ym, _, _ in rows}),
+        "seasonality_strength": cv,  # coefficient of variation of monthly avgs
+        "monthly": monthly,
+        "yearly": yearly,
+    }
+
+
 class ForecastRequest(BaseModel):
     region: str = Field(..., description="Region name (e.g. 'Атырауская область')")
     icd: str = Field(..., description="ICD-10 code (e.g. 'I20.8')")

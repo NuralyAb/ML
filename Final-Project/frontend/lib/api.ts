@@ -145,6 +145,30 @@ export type GlobalStats = {
   period_end: string | null;
 };
 
+export type SeasonalityMonth = {
+  month: number;       // 1..12
+  avg: number;
+  min: number;
+  max: number;
+  median: number;
+  n_years: number;
+};
+
+export type SeasonalityYear = {
+  year: number;
+  values: number[];    // 12 entries, one per calendar month
+};
+
+export type SeasonalityResponse = {
+  icd: string;
+  region: string | null;
+  nozology: string;
+  n_years: number;
+  seasonality_strength: number;    // CV of monthly averages, 0..~1
+  monthly: SeasonalityMonth[];
+  yearly: SeasonalityYear[];
+};
+
 const base = ""; // Same-origin via the rewrite proxy.
 
 async function get<T>(url: string): Promise<T> {
@@ -191,6 +215,10 @@ export const api = {
   historical:       (region: string, icd: string) =>
     get<HistoricalSeries>(
       `/api/historical?region=${encodeURIComponent(region)}&icd=${encodeURIComponent(icd)}`
+    ),
+  seasonality:      (icd: string, region?: string) =>
+    get<SeasonalityResponse>(
+      `/api/seasonality?icd=${encodeURIComponent(icd)}${region ? `&region=${encodeURIComponent(region)}` : ""}`
     ),
   regionSummary:    (opts?: { icd?: string; chapter?: string; period?: Period; view?: RegionView } | string, periodOrUndef?: Period) => {
     // Back-compat: accept (icd, period) signature too.
