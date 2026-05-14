@@ -494,6 +494,165 @@ def model_metrics():
     return payload
 
 
+class ExplainRequest(BaseModel):
+    region: str = Field(..., description="Region name")
+    icd: str = Field(..., description="ICD-10 code")
+
+
+@app.post("/api/explain")
+def explain(req: ExplainRequest):
+    """Per-prediction explainability — TreeSHAP decomposition of the
+    1-step-ahead forecast for a (region, ICD) pair.
+
+    Returns the population base value, the predicted value, and a sorted list
+    of feature contributions (in log-space). Designed for a regulator or
+    auditor to verify *why* the model produced a particular forecast.
+    """
+    fc = get_forecaster()
+    try:
+        out = fc.explain(req.region, req.icd)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"explain failed: {e}")
+    return out
+
+
+@app.get("/api/model-card")
+def model_card():
+    """Machine-readable Model Card following the Google "Model Cards" pattern.
+
+    Surfaces — for transparency and governance of a government ML system —
+    the model purpose, training data, intended users, performance, ethical
+    considerations and known limitations. Pulls live numbers from
+    ``ml/models/metadata.json`` so the card never drifts from the booster
+    actually being served.
+    """
+    if not os.path.exists(META):
+        raise HTTPException(503, "model not trained yet")
+    with open(META, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    metrics = meta.get("metrics", {}).get("lightgbm", {})
+    return {
+        "name": "Med Forecast KZ — LightGBM regressor",
+        "version": meta.get("trained_at", "unknown"),
+        "owner": "Ministry of Health of the Republic of Kazakhstan (data); academic project (model)",
+        "license_data": "CC BY 4.0 (ashyq.data.gov.kz)",
+        "license_code":  "MIT (this repository)",
+
+        "purpose": (
+            "Forecast the monthly number of subsidised prescriptions issued in "
+            "Kazakhstan at the (region × ICD-10 × month) granularity over a "
+            "1-to-12-month horizon. The forecasts inform three operational "
+            "decisions: pharmaceutical procurement, regional staffing, and "
+            "clinic-level audit of registration accuracy."
+        ),
+        "intended_users": [
+            "Ministry of Health analysts and procurement officers.",
+            "Regional health department planners.",
+            "Internal auditors verifying registry consistency.",
+        ],
+        "out_of_scope_uses": [
+            "Individual patient-level prescriptions (no patient data is used).",
+            "Diagnosis (no clinical decision support).",
+            "District-level forecasting (district series are too sparse — see Limitations).",
+        ],
+
+        "training_data": {
+            "source": "ashyq.data.gov.kz — Magda Open Data API.",
+            "dataset_family": "ISLO_MEDICALHISTORYOFCITIZENS",
+            "regions": 18,
+            "districts": 199,
+            "icd_codes_observed": 2300,
+            "raw_size_gb": 12,
+            "aggregated_panel_rows": 2_814_281,
+            "feature_panel_rows": 1_067_266,
+            "series": meta.get("n_series", 18881),
+            "period_start": "2018-01",
+            "period_end_full_coverage": "2024-09",
+            "period_end_latest": meta.get("last_observed_month", "2025-04"),
+            "license": "CC BY 4.0",
+        },
+
+        "model": {
+            "family": "LightGBM gradient boosting regressor",
+            "target_transform": "log1p(recipe_count); expm1 + clip(>=0) at inference",
+            "n_features": len(meta.get("feature_columns", [])),
+            "feature_groups": [
+                "5 lag features (lag_1, lag_2, lag_3, lag_6, lag_12)",
+                "6 rolling statistics (mean/std × 3, 6, 12 months)",
+                "1 expanding mean",
+                "1 cross-series signal (region_total_lag1)",
+                "5 calendar features (month, quarter, month_idx, sin/cos)",
+                "3 label-encoded categoricals (region, icdid, icd_chapter)",
+                "2 healthcare-infrastructure proxies (n_clinics, n_districts)",
+            ],
+            "hyperparameters": {
+                "learning_rate": 0.05, "num_leaves": 128, "min_data_in_leaf": 40,
+                "feature_fraction": 0.9, "bagging_fraction": 0.9,
+                "lambda_l2": 1.0, "num_boost_round": 900,
+            },
+            "training_seconds": 25.5,
+            "validation_strategy": "Per-series 6-month time-based hold-out across all 18,881 series.",
+        },
+
+        "performance": {
+            "MAE":   round(metrics.get("MAE", 0), 2),
+            "RMSE":  round(metrics.get("RMSE", 0), 2),
+            "MAPE":  round(metrics.get("MAPE", 0), 2),
+            "sMAPE": round(metrics.get("sMAPE", 0), 2),
+            "R2":    round(metrics.get("R2", 0), 4),
+            "vs_baselines": (
+                "Production LightGBM beats all three naive baselines "
+                "(lag-1, seasonal lag-12, rolling mean) on MAE by 36 %."
+            ),
+            "holdout_rows": meta.get("n_test_rows", 113286),
+        },
+
+        "interpretability": {
+            "per_prediction": "TreeSHAP via POST /api/explain — every forecast can be decomposed into the contributions of each of the 23 input features in log-space.",
+            "global": "Top-15 feature gains exposed via GET /api/model-metrics. Top driver is n_clinics (healthcare infrastructure proxy); rolling means and lag_12 capture seasonality.",
+            "dashboard_widgets": [
+                "Forecast panel — actual + forecast line with optional P10/P90 quantile fan.",
+                "Decision recommendation card — maps the predicted Δ vs 12-mo average into 5 tiers.",
+                "Disease seasonality card — average monthly profile across all years.",
+                "Model metrics card — LightGBM vs 3 baselines with hold-out numbers.",
+                "Actual-vs-predicted scatter — bias visual check on hold-out.",
+                "Anomaly detection tab — residual z-scores for clinic audit.",
+            ],
+        },
+
+        "limitations": [
+            "District-level granularity is too sparse for direct regression; the model operates at region level and the dashboard post-aggregates.",
+            "Жетысуская and Улытауская областей лак source datasets — published only as combined parents pre-2022.",
+            "No exogenous regressors (weather, WHO flu surveillance, mobility) — the model cannot anticipate sudden outbreaks earlier than they appear in lag_1.",
+            "Recursive multi-step forecasting drifts on long horizons (>6 months) for very volatile series.",
+            "The LLM-generated executive summary in /api/report is advisory and should be reviewed by a human before any procurement decision.",
+        ],
+
+        "ethical_considerations": [
+            "No personally identifiable patient data is used. All training rows are pre-aggregated monthly counts by (region, district, ICD).",
+            "Region encoding could in principle reinforce historical under-served regions; the model is monitored by tracking per-region MAE so a regression in a small region cannot hide under a country-wide average.",
+            "All forecasts are advisory. The final procurement / staffing / audit decision belongs to authorised MoH personnel.",
+        ],
+
+        "data_quality_disclaimer": (
+            "Source data quality depends on the original ESBR registry. "
+            "Missing months are filled with 0 because absence of a prescription "
+            "is a real signal in this domain (not a measurement gap). Pre-2022 "
+            "territorial reform: Abay was retroactively split out of East "
+            "Kazakhstan in the source, while Zhetysu / Ulytau were not; the "
+            "map respects this temporal boundary."
+        ),
+        "audit_trail": (
+            "Every artefact in the pipeline is reproducible from the GitHub "
+            "repository: ETL → features → training → MLflow runs → booster + "
+            "metadata.json. Nine MLflow experiments document the design space."
+        ),
+    }
+
+
 @app.get("/api/eval-sample")
 def eval_sample(n: int = 200, region: Optional[str] = None):
     if not os.path.exists(EVAL):

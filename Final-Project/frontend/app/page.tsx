@@ -17,6 +17,8 @@ import { DataIngestPanel } from "@/components/DataIngestPanel";
 import { GeoHeatmap } from "@/components/GeoHeatmap";
 import { HistoricalChart } from "@/components/HistoricalChart";
 import { SeasonalityPanel } from "@/components/SeasonalityPanel";
+import { ExplainabilityPanel } from "@/components/ExplainabilityPanel";
+import { ModelCardPanel } from "@/components/ModelCardPanel";
 import { fmtInt, fmtMonth } from "@/lib/format";
 
 import type { GlobalStats, HeatmapCell, RegionRow, RegionTotal } from "@/lib/api";
@@ -210,6 +212,22 @@ export default function Page() {
               initialIcd={selectedIcd}
             />
           )}
+        </section>
+
+        {/* Per-prediction explainability (TreeSHAP) */}
+        <section className="mt-6">
+          {regions.length > 0 && (
+            <ExplainabilityPanel
+              regions={regions}
+              initialRegion={selectedRegion}
+              initialIcd={selectedIcd}
+            />
+          )}
+        </section>
+
+        {/* Model Card — governance & transparency block */}
+        <section className="mt-6">
+          <ModelCardPanel />
         </section>
 
         {/* Disease heatmap + top diseases */}

@@ -169,6 +169,48 @@ export type SeasonalityResponse = {
   yearly: SeasonalityYear[];
 };
 
+export type ExplainContribution = {
+  feature: string;
+  value: number | string;
+  display_value: number | string;
+  contribution_log: number;   // SHAP value in log-space (model trains on log1p target)
+};
+
+export type ExplainResponse = {
+  region: string;
+  icd: string;
+  nozology: string;
+  target_month: string;
+  base_value: number;          // population baseline (recipe count)
+  base_value_log: number;
+  predicted: number;
+  predicted_log: number;
+  contributions: ExplainContribution[];
+};
+
+export type ModelCard = {
+  name: string;
+  version: string;
+  owner: string;
+  license_data: string;
+  license_code: string;
+  purpose: string;
+  intended_users: string[];
+  out_of_scope_uses: string[];
+  training_data: Record<string, any>;
+  model: Record<string, any>;
+  performance: Record<string, any>;
+  interpretability: {
+    per_prediction: string;
+    global: string;
+    dashboard_widgets: string[];
+  };
+  limitations: string[];
+  ethical_considerations: string[];
+  data_quality_disclaimer: string;
+  audit_trail: string;
+};
+
 const base = ""; // Same-origin via the rewrite proxy.
 
 async function get<T>(url: string): Promise<T> {
@@ -220,6 +262,9 @@ export const api = {
     get<SeasonalityResponse>(
       `/api/seasonality?icd=${encodeURIComponent(icd)}${region ? `&region=${encodeURIComponent(region)}` : ""}`
     ),
+  explain:          (region: string, icd: string) =>
+    post<ExplainResponse>("/api/explain", { region, icd }),
+  modelCard:        () => get<ModelCard>("/api/model-card"),
   regionSummary:    (opts?: { icd?: string; chapter?: string; period?: Period; view?: RegionView } | string, periodOrUndef?: Period) => {
     // Back-compat: accept (icd, period) signature too.
     let icd: string | undefined; let chapter: string | undefined;
