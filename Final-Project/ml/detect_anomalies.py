@@ -65,7 +65,7 @@ TIERS: list[Tuple[float, float, str]] = [
     (2.0, 3.0, "warning"),
     (1.5, 2.0, "notice"),
 ]
-MIN_Z_KEEP = 1.5         # rows with |z| below this are not saved
+MIN_Z_KEEP = 2.0         # rows with |z| below this are not saved
 
 
 def icd_chapter(code: str) -> str:
